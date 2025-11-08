@@ -1,0 +1,70 @@
+name: Get tag from tfc-hmi repo and retag this repo if needed
+
+on:
+  workflow_dispatch:
+  push:
+    branches:
+      - main
+
+permissions:
+  contents: write
+  packages: write
+
+jobs:
+  tag-checker:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Make safe directory
+        run: git config --system --add safe.directory '*'
+      - name: Checkout tfc-hmi
+        uses: actions/checkout@v4
+        with:
+          repository: centroid-is/tfc-hmi
+          token: ${{ secrets.GH_PAT }}
+          path: tfc-hmi
+          ref: master
+          fetch-depth: 0
+
+      - name: Get latest tag from tfc-hmi
+        id: tfc-hmi-tag
+        run: |
+          cd tfc-hmi
+          LATEST_TAG=$(git describe --tags --abbrev=0)
+          echo "tag=$LATEST_TAG" >> $GITHUB_OUTPUT
+          echo "Latest tfc-hmi tag: $LATEST_TAG"
+
+      - name: Checkout this repository
+        uses: actions/checkout@v4
+        with:
+          path: current-repo
+          fetch-depth: 0
+          token: ${{ secrets.GH_PAT }}
+
+      - name: Check if tag exists in this repo
+        id: check-tag
+        run: |
+          cd current-repo
+          CURRENT_TAG=$(git describe --tags --abbrev=0 2>/dev/null || echo "none")
+          echo "current_tag=$CURRENT_TAG" >> $GITHUB_OUTPUT
+          echo "Current repo tag: $CURRENT_TAG"
+          echo "Target tag: ${{ steps.tfc-hmi-tag.outputs.tag }}"
+
+          if [ "$CURRENT_TAG" != "${{ steps.tfc-hmi-tag.outputs.tag }}" ]; then
+            echo "needs_tag=true" >> $GITHUB_OUTPUT
+          else
+            echo "needs_tag=false" >> $GITHUB_OUTPUT
+          fi
+
+      - name: Create new tag
+        if: steps.check-tag.outputs.needs_tag == 'true'
+        run: |
+          cd current-repo
+          git config user.name "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+          git tag -a ${{ steps.tfc-hmi-tag.outputs.tag }} -m "Sync tag from tfc-hmi: ${{ steps.tfc-hmi-tag.outputs.tag }}"
+          git push origin ${{ steps.tfc-hmi-tag.outputs.tag }}
+          echo "Created and pushed tag: ${{ steps.tfc-hmi-tag.outputs.tag }}"
+
+      - name: No tag needed
+        if: steps.check-tag.outputs.needs_tag == 'false'
+        run: echo "Repository is already up to date with tag ${{ steps.tfc-hmi-tag.outputs.tag }}"
