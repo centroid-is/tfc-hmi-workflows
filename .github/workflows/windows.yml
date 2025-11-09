@@ -1,0 +1,148 @@
+name: Store publish (MSIX via StoreBroker)
+
+on:
+  workflow_dispatch:
+  push:
+    tags:
+      - '*'
+
+permissions:
+  contents: write
+  packages: write
+
+jobs:
+  publish:
+    runs-on: windows-latest
+    env:
+      STORE_APP_ID:          ${{ secrets.STORE_PRODUCT_ID }}   # Your app's AppId / StoreId (e.g. 9N1C64WM15R1)
+      STORE_TENANT_ID:       ${{ secrets.STORE_TENANT_ID }}
+      STORE_CLIENT_ID:       ${{ secrets.STORE_CLIENT_ID }}
+      STORE_CLIENT_SECRET:   ${{ secrets.STORE_CLIENT_SECRET }}
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          repository: centroid-is/tfc-hmi
+          token: ${{ secrets.GH_PAT }}
+          path: tfc-hmi
+          ref: main
+
+      - name: Allow pub to access private Git deps
+        shell: pwsh
+        env:
+          GH_PAT: ${{ secrets.GH_PAT }}
+        run: |
+          git config --global url."https://x-access-token:${env:GH_PAT}@github.com/centroid-is/".insteadOf "https://github.com/centroid-is/"
+
+      - name: Setup Flutter
+        uses: subosito/flutter-action@v2
+        with:
+          channel: stable
+
+      - name: Build Windows
+        working-directory: tfc-hmi/centroid-hmi
+        run: flutter build windows --release
+
+      - name: Create MSIX for Store
+        working-directory: tfc-hmi/centroid-hmi
+        shell: powershell
+        run: |
+          dart run msix:create --store
+
+      - name: Find built MSIX
+        id: pkg
+        working-directory: tfc-hmi/centroid-hmi
+        shell: powershell
+        run: |
+          $msix = Get-ChildItem -Recurse -Filter *.msix | Sort-Object LastWriteTime -Descending | Select-Object -First 1
+          if (-not $msix) { throw "No .msix found" }
+          "msix=$($msix.FullName)" | Out-File -FilePath $env:GITHUB_OUTPUT -Append
+
+      - name: Upload artifact (.msix)  # optional, handy for debugging
+        uses: actions/upload-artifact@v4
+        with:
+          name: sv.msix
+          path: ${{ steps.pkg.outputs.msix }}
+
+      - name: Publish via StoreBroker
+        working-directory: tfc-hmi/centroid-hmi
+        shell: powershell
+        run: |
+          $ErrorActionPreference = 'Stop'
+
+          # Harden PowerShellGet / PSGallery so Install-Module is non-interactive
+          try { [Net.ServicePointManager]::SecurityProtocol = [Net.SecurityProtocolType]::Tls12 } catch {}
+          Install-PackageProvider -Name NuGet -MinimumVersion 2.8.5.201 -Force | Out-Null
+          Set-PSRepository -Name 'PSGallery' -InstallationPolicy Trusted
+          Install-Module StoreBroker -Scope CurrentUser -Force
+          Import-Module StoreBroker
+
+          # Validate required secrets early
+          $required = @('STORE_APP_ID','STORE_TENANT_ID','STORE_CLIENT_ID','STORE_CLIENT_SECRET')
+          $missing  = $required | Where-Object {
+            [string]::IsNullOrWhiteSpace([Environment]::GetEnvironmentVariable($_))
+          }
+          if ($missing.Count) { throw "Missing required secrets: $($missing -join ', ')" }
+
+          # Authenticate once; StoreBroker handles token refresh
+          $sec  = ConvertTo-SecureString $env:STORE_CLIENT_SECRET -AsPlainText -Force
+          $cred = New-Object pscredential($env:STORE_CLIENT_ID, $sec)
+          Set-StoreBrokerAuthentication -TenantId $env:STORE_TENANT_ID -Credential $cred
+
+          # Resolve paths explicitly to avoid empty/relative binding issues
+          $ConfigPath = Join-Path (Get-Location) 'submission.json'
+          $OutDir     = Join-Path (Get-Location) 'out'
+          $OutName    = 'package'
+          $MsixPath   = "${{ steps.pkg.outputs.msix }}"
+
+          if (-not (Test-Path $ConfigPath)) {
+            New-StoreBrokerConfigFile -Path $ConfigPath -AppId $env:STORE_APP_ID
+          }
+
+          # Produce package.zip + package.json from the MSIX
+          New-SubmissionPackage -ConfigPath $ConfigPath `
+                                -AppxPath   $MsixPath `
+                                -OutPath    $OutDir `
+                                -OutName    $OutName
+
+          # Create a fresh submission
+          $sub = New-ApplicationSubmission -AppId $env:STORE_APP_ID -Force
+
+          # Upload the ZIP first (required so the service can reference the file)
+          $packageZip = Join-Path $OutDir "$OutName.zip"
+          Set-SubmissionPackage -PackagePath $packageZip -UploadUrl $sub.fileUploadUrl
+
+          # Replace package list with the newly generated ones
+          $sub.applicationPackages | ForEach-Object { $_.fileStatus = 'PendingDelete' }
+          $pkg = Get-Content (Join-Path $OutDir "$OutName.json") -Raw | ConvertFrom-Json
+          $sub.applicationPackages += $pkg.applicationPackages
+
+          # Save updated submission and then commit
+          Set-ApplicationSubmission -AppId $env:STORE_APP_ID -UpdatedSubmission $sub
+          Complete-ApplicationSubmission -AppId $env:STORE_APP_ID -SubmissionId $sub.id
+
+          # After Complete-ApplicationSubmission...
+          $submissionId = $sub.id
+
+          # Poll until we leave the in-progress states
+          $inProgress = @('PendingCommit','CommitStarted','PreProcessing','Certification','PendingPublication','Publishing')
+          $terminalOk = @('Published','Release')
+          $terminalBad = @('CommitFailed','PreProcessingFailed','CertificationFailed','PublishFailed','ReleaseFailed','Canceled')
+
+          do {
+            Start-Sleep -Seconds 30
+            $status = (Get-ApplicationSubmissionStatus -AppId $env:STORE_APP_ID -SubmissionId $submissionId).status
+            Write-Host "Submission $submissionId status: $status"
+          } while ($inProgress -contains $status)
+
+          if ($terminalBad -contains $status) { throw "Store submission failed: $status" }
+          if ($terminalOk  -contains $status) { Write-Host "Store submission completed: $status" }
+          else { Write-Warning "Unexpected terminal status: $status" }
+
+      - name: Upload submission artifacts  # optional, inspect what StoreBroker produced
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: store-out
+          path: tfc-hmi/centroid-hmi/out
