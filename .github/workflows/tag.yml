@@ -22,7 +22,7 @@ jobs:
           repository: centroid-is/tfc-hmi
           token: ${{ secrets.GH_PAT }}
           path: tfc-hmi
-          ref: master
+          ref: main
           fetch-depth: 0
 
       - name: Get latest tag from tfc-hmi
