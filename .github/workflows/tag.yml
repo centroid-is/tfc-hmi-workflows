@@ -15,7 +15,7 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - name: Make safe directory
-        run: git config --system --add safe.directory '*'
+        run: sudo git config --system --add safe.directory '*'
       - name: Checkout tfc-hmi
         uses: actions/checkout@v4
         with:
