@@ -38,6 +38,10 @@ jobs:
     steps:
       - name: Work out the event
         id: ev
+        env:
+          PR_SHA: ${{ github.event.pull_request.head.sha }}
+          PR_NUMBER: ${{ github.event.pull_request.number }}
+          PR_BRANCH: ${{ github.event.pull_request.head.ref }}
         run: |
           case "$GITHUB_EVENT_NAME/$GITHUB_REF" in
             push/refs/heads/main)
@@ -50,10 +54,7 @@ jobs:
               ;;
             pull_request/*)
               type=pull-request
-              payload=$(jq -nc --arg sha "${{ github.event.pull_request.head.sha }}" \
-                --arg pr "${{ github.event.pull_request.number }}" \
-                --arg branch "${{ github.event.pull_request.head.ref }}" \
-                '{sha: $sha, pr: $pr, branch: $branch}')
+              payload=$(jq -nc --arg sha "$PR_SHA" --arg pr "$PR_NUMBER" --arg branch "$PR_BRANCH" '{sha: $sha, pr: $pr, branch: $branch}')
               ;;
             *)
               echo "nothing to dispatch for $GITHUB_EVENT_NAME on $GITHUB_REF"
@@ -68,6 +69,8 @@ jobs:
         if: steps.ev.outputs.type != ''
         env:
           GH_TOKEN: ${{ secrets.WORKFLOWS_DISPATCH_TOKEN }}
+          TYPE: ${{ steps.ev.outputs.type }}
+          PAYLOAD: ${{ steps.ev.outputs.payload }}
         run: |
-          gh api repos/centroid-is/tfc-hmi-workflows/dispatches \
-            --input <(jq -nc --arg t '${{ steps.ev.outputs.type }}' --argjson p '${{ steps.ev.outputs.payload }}' '{event_type: $t, client_payload: $p}')
+          jq -nc --arg t "$TYPE" --argjson p "$PAYLOAD" '{event_type: $t, client_payload: $p}' > body.json
+          gh api repos/centroid-is/tfc-hmi-workflows/dispatches --input body.json
