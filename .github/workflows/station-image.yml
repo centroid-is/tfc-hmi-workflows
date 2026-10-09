@@ -334,6 +334,9 @@ jobs:
 
       - name: Boot the installer and photograph it
         run: |
+          # The lists from "Install image tools" are twenty minutes old by now
+          # and the mirror has moved on under them once already (404 on ovmf).
+          sudo apt-get update -qq
           sudo apt-get install -y qemu-system-x86 ovmf
           img="$RUNNER_TEMP/usb.img"
           [ -f "$img" ] || gunzip -c out/usb-installer.img.gz > "$img"
