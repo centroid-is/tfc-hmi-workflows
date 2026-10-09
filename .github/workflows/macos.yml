@@ -194,6 +194,10 @@ jobs:
           APPLE_ID_PASSWORD: ${{ secrets.APPLE_ID_PASSWORD }}
           APPLE_TEAM_ID: ${{ secrets.APPLE_TEAM_ID }}
         run: |
+          if [ -z "$APPLE_ID" ] || [ -z "$APPLE_ID_PASSWORD" ]; then
+            echo "::notice title=Not notarized::APPLE_ID and APPLE_ID_PASSWORD are not set; $DMG_NAME is signed but not notarized. Gatekeeper will warn on first open."
+            exit 0
+          fi
           if ! xcrun notarytool submit "$DMG_NAME" --apple-id "$APPLE_ID" --password "$APPLE_ID_PASSWORD" --team-id "$APPLE_TEAM_ID" --wait; then
             echo "::warning title=Notarization failed::notarytool did not accept $DMG_NAME; the DMG is signed but not notarized."
             exit 1
