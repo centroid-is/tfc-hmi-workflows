@@ -387,8 +387,8 @@ jobs:
       - working-directory: src/packages/media_kit_video_elinux
         run: |
           cmake -S elinux/test -B build/test -DCMAKE_BUILD_TYPE=Debug
-          cmake --build build/test
-          ctest --test-dir build/test --verbose --output-on-failure 2>&1 | tee test-output.txt
+          cmake --build build/test --config Debug
+          ctest --test-dir build/test --build-config Debug --verbose --output-on-failure 2>&1 | tee test-output.txt
           ran=$(grep -c 'RUN  ' test-output.txt || true)
           echo "$ran tests ran"
           [ "$ran" -ge 16 ]
@@ -412,8 +412,8 @@ jobs:
         working-directory: src/packages/webview_cef
         run: |
           cmake -S common/test -B build/test -DCMAKE_BUILD_TYPE=Debug
-          cmake --build build/test
-          ctest --test-dir build/test --verbose --output-on-failure 2>&1 | tee test-output.txt
+          cmake --build build/test --config Debug
+          ctest --test-dir build/test --build-config Debug --verbose --output-on-failure 2>&1 | tee test-output.txt
           ran=$(grep -c 'RUN  ' test-output.txt || true)
           floor=40; [ "${{ runner.os }}" = Windows ] && floor=28
           echo "$ran tests ran (floor $floor)"
