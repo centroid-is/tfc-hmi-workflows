@@ -64,7 +64,7 @@ Set on tfc-hmi:
 
 | Secret | Used for |
 |---|---|
-| `WORKFLOWS_DISPATCH_TOKEN` | the bridge workflow: `repository_dispatch`, the mirror branches and the mirror pull requests here (Contents and Pull requests read/write on this repository) |
+| `WORKFLOWS_DISPATCH_TOKEN` | the bridge workflow, which runs on a self-hosted runner (git, gh and bash; no Actions minutes): `repository_dispatch`, the mirror branches and the mirror pull requests here (Contents and Pull requests read/write on this repository) |
 
 ## Running things by hand
 

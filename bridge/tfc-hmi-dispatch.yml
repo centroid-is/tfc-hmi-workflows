@@ -1,10 +1,12 @@
-# Copy this file into tfc-hmi as .github/workflows/dispatch.yml.
+# Copy this file into tfc-hmi (centroid-is/CentroidX) as
+# .github/workflows/dispatch.yml.
 #
 # tfc-hmi is private; its builds, tests and releases run in the public
 # repository centroid-is/tfc-hmi-workflows. This is the one workflow that has
 # to stay in tfc-hmi: it tells the other repository that something happened.
-# It runs for a few seconds on ubuntu-latest, which is all the private-repo
-# Actions minutes the move leaves in use.
+# It runs on a self-hosted runner (runs-on: self-hosted), so it costs no
+# private-repo Actions minutes. The runner needs git, gh and bash (Git for
+# Windows is enough on a Windows box), nothing else.
 #
 # Needs one secret in tfc-hmi, WORKFLOWS_DISPATCH_TOKEN: a token with
 # Contents and Pull requests read/write on centroid-is/tfc-hmi-workflows.
@@ -44,33 +46,31 @@ env:
 jobs:
   dispatch:
     if: github.event_name == 'push'
-    runs-on: ubuntu-latest
+    runs-on: self-hosted
     steps:
       - name: Send the push as a repository_dispatch
+        shell: bash
         env:
           GH_TOKEN: ${{ secrets.WORKFLOWS_DISPATCH_TOKEN }}
         run: |
           case "$GITHUB_REF" in
             refs/heads/main)
-              type=push-main
-              payload=$(jq -nc --arg repo "$GITHUB_REPOSITORY" --arg sha "$GITHUB_SHA" '{repository: $repo, sha: $sha}')
+              gh api "repos/$WORKFLOWS_REPO/dispatches" -f event_type=push-main \
+                -f "client_payload[repository]=$GITHUB_REPOSITORY" -f "client_payload[sha]=$GITHUB_SHA"
               ;;
             refs/tags/*)
-              type=tag
-              payload=$(jq -nc --arg repo "$GITHUB_REPOSITORY" --arg sha "$GITHUB_SHA" --arg tag "${GITHUB_REF#refs/tags/}" '{repository: $repo, sha: $sha, tag: $tag}')
+              gh api "repos/$WORKFLOWS_REPO/dispatches" -f event_type=tag \
+                -f "client_payload[repository]=$GITHUB_REPOSITORY" -f "client_payload[sha]=$GITHUB_SHA" \
+                -f "client_payload[tag]=${GITHUB_REF#refs/tags/}"
               ;;
             *)
               echo "nothing to dispatch for $GITHUB_REF"
-              exit 0
               ;;
           esac
-          echo "$type $payload"
-          jq -nc --arg t "$type" --argjson p "$payload" '{event_type: $t, client_payload: $p}' > body.json
-          gh api "repos/$WORKFLOWS_REPO/dispatches" --input body.json
 
   mirror-pr:
     if: github.event_name == 'pull_request'
-    runs-on: ubuntu-latest
+    runs-on: self-hosted
     env:
       GH_TOKEN: ${{ secrets.WORKFLOWS_DISPATCH_TOKEN }}
       ACTION: ${{ github.event.action }}
@@ -89,6 +89,7 @@ jobs:
 
       - name: Close the mirror
         if: env.ACTION == 'closed'
+        shell: bash
         run: |
           branch="tfc-hmi/pr-$PR_NUMBER"
           for n in $(gh pr list --repo "$WORKFLOWS_REPO" --head "$branch" --state open --json number -q '.[].number'); do
@@ -98,14 +99,16 @@ jobs:
 
       - name: Push the source commit to the mirror branch
         if: env.ACTION != 'closed'
+        shell: bash
         run: |
           branch="tfc-hmi/pr-$PR_NUMBER"
           git config user.name "github-actions[bot]"
           git config user.email "github-actions[bot]@users.noreply.github.com"
           git checkout -B "$branch" origin/main
-          jq -n --arg repo "$GITHUB_REPOSITORY" --arg sha "$PR_SHA" --arg pr "$PR_NUMBER" \
-            --arg branch "$PR_BRANCH" --arg title "$PR_TITLE" --arg url "$PR_URL" \
-            '{repository: $repo, sha: $sha, pr: $pr, branch: $branch, title: $title, url: $url}' > tfc-hmi-source.json
+          # gh's built-in jq writes the file, so the runner needs no jq.
+          gh api "repos/$GITHUB_REPOSITORY/pulls/$PR_NUMBER" \
+            --jq '{repository: $ENV.GITHUB_REPOSITORY, sha: $ENV.PR_SHA, pr: $ENV.PR_NUMBER, branch: $ENV.PR_BRANCH, title: $ENV.PR_TITLE, url: $ENV.PR_URL}' \
+            > tfc-hmi-source.json
           cat tfc-hmi-source.json
           git add tfc-hmi-source.json
           git commit -m "tfc-hmi#$PR_NUMBER at ${PR_SHA:0:7}: $PR_TITLE"
@@ -113,6 +116,7 @@ jobs:
 
       - name: Open the mirror pull request if there is none
         if: env.ACTION != 'closed'
+        shell: bash
         run: |
           branch="tfc-hmi/pr-$PR_NUMBER"
           existing=$(gh pr list --repo "$WORKFLOWS_REPO" --head "$branch" --state open --json number -q '.[0].number')
