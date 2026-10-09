@@ -11,10 +11,15 @@ run-name: ${{ github.head_ref || github.event.action || github.event_name }}
 #
 # A pull request of tfc-hmi arrives as a mirror pull request here: the bridge
 # workflow in tfc-hmi keeps a branch tfc-hmi/pr-N whose one file,
-# tfc-hmi-source.json, names the commit to test, and force-pushes it on every
-# push over there. So this runs as an ordinary pull_request, with its checks
-# on the mirror PR, and the verdict goes back to tfc-hmi as a commit status
-# named "tfc-hmi-workflows / tests" on the source commit.
+# tfc-hmi-source.json, names the commit to test, and adds a commit to it on
+# every push over there. So this runs as an ordinary pull_request, with its
+# checks on the mirror PR, and the verdict goes back to tfc-hmi as a commit
+# status named "tfc-hmi-workflows / tests" on the source commit.
+#
+# The bridge never force-pushes that branch, so a workflow change for one
+# tfc-hmi pull request can be committed to its mirror branch: the run reads
+# the workflows and the source file from the same merge, so such a push is
+# tested against the source commit the branch names and reports to it.
 #
 # A pull request of this repository itself, with no source file, tests
 # tfc-hmi main against the changed workflows. Pushes to tfc-hmi main arrive

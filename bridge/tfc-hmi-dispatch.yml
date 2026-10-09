@@ -18,12 +18,28 @@
 #     tag (not main-latest, not station-v*)
 #   pull request        -> a mirror pull request over there: branch
 #     opened, pushed to,    tfc-hmi/pr-N carrying tfc-hmi-source.json, which
-#     reopened, closed      names the commit to test. Every push here
-#                           force-pushes that branch, so Tests runs there as an
-#                           ordinary pull request with its checks on it; the
+#     reopened, closed      names the commit to test. Every push here adds
+#                           one commit to that branch, so Tests runs there as
+#                           an ordinary pull request with its checks on it; the
 #                           verdict comes back here as the commit status
 #                           "tfc-hmi-workflows / tests". Closing here closes
 #                           the mirror and deletes its branch.
+#
+# The mirror branch is APPENDED to, never force-pushed. The first sync starts
+# it from main over there; every later one checks out what the branch holds
+# and commits tfc-hmi-source.json on top, touching no other file. So a
+# workflow change that belongs with one pull request here can be committed to
+# tfc-hmi/pr-N over there, by hand, and it stays: later pushes here are tested
+# with it. Two things follow from not forcing:
+#   * A sync whose commit is already the one the branch names adds nothing and
+#     starts no run (a re-run of this job, say). Re-run Tests over there.
+#   * A hand-made change on the mirror can come to conflict with main over
+#     there. A conflicted pull request gets no runs at all, silently, so this
+#     job checks for it and fails with the reason instead. Resolve it on the
+#     mirror branch (merge main into it); this job never does that for you.
+# Closing the pull request here deletes the mirror branch and whatever was
+# committed to it. A workflow change worth keeping has to reach main over
+# there on its own, before that.
 #
 # tfc-hmi-workflows is PUBLIC and tfc-hmi is not. The mirror therefore carries
 # the pull request's number and commit and nothing else: it is titled "pr-N",
@@ -100,23 +116,65 @@ jobs:
           done
           git push origin --delete "$branch" 2>/dev/null || true
 
-      - name: Push the source commit to the mirror branch
+      - name: Add the source commit to the mirror branch
         if: env.ACTION != 'closed'
         shell: bash
         run: |
+          set -euo pipefail
           branch="tfc-hmi/pr-$PR_NUMBER"
           git config user.name "github-actions[bot]"
           git config user.email "github-actions[bot]@users.noreply.github.com"
-          git checkout -B "$branch" origin/main
+
+          # Start from what the mirror already holds, so anything committed
+          # to it by hand survives; from main only when there is no mirror.
+          # ls-remote, not the local refs: a self-hosted runner keeps its
+          # workspace, and with it remote-tracking refs of deleted branches.
+          start_from() {
+            git fetch --quiet origin main
+            if git ls-remote --exit-code --heads origin "$branch" >/dev/null; then
+              git fetch --quiet origin "+refs/heads/$branch:refs/remotes/origin/$branch"
+              git checkout --quiet -B "$branch" "origin/$branch"
+            else
+              git checkout --quiet -B "$branch" origin/main
+            fi
+          }
+
           # Number and commit only: this file is public. gh's built-in jq
-          # writes it, so the runner needs no jq.
-          gh api "repos/$GITHUB_REPOSITORY/pulls/$PR_NUMBER" \
-            --jq '{repository: $ENV.GITHUB_REPOSITORY, sha: $ENV.PR_SHA, pr: $ENV.PR_NUMBER}' \
-            > tfc-hmi-source.json
+          # writes it, so the runner needs no jq. Nothing is committed when
+          # the branch already names this commit.
+          record() {
+            gh api "repos/$GITHUB_REPOSITORY/pulls/$PR_NUMBER"               --jq '{repository: $ENV.GITHUB_REPOSITORY, sha: $ENV.PR_SHA, pr: $ENV.PR_NUMBER}'               > tfc-hmi-source.json
+            git add tfc-hmi-source.json
+            if git diff --cached --quiet; then
+              echo "the mirror already names ${PR_SHA:0:7}; nothing to add"
+            else
+              git commit --quiet -m "pr-$PR_NUMBER at ${PR_SHA:0:7}"
+            fi
+          }
+
+          # Never forced. A rejected push means somebody pushed to the mirror
+          # in between: take theirs and put the one commit on top again.
+          pushed=false
+          for attempt in 1 2 3; do
+            start_from
+            record
+            if git push origin "$branch"; then pushed=true; break; fi
+            echo "push rejected (attempt $attempt); the mirror moved, starting again from it"
+            sleep $((attempt * 2))
+          done
+          if [ "$pushed" != true ]; then
+            echo "::error::could not push $branch to $WORKFLOWS_REPO without forcing, after 3 attempts"
+            exit 1
+          fi
           cat tfc-hmi-source.json
-          git add tfc-hmi-source.json
-          git commit -m "pr-$PR_NUMBER at ${PR_SHA:0:7}"
-          git push --force origin "$branch"
+          git log --oneline -5 "$branch"
+
+          # A mirror that conflicts with main gets no pull_request runs, and
+          # says nothing about it. Only a hand-made change can cause that.
+          if ! git merge-tree --write-tree origin/main "$branch" >/dev/null; then
+            echo "::error::$branch conflicts with main in $WORKFLOWS_REPO, so Tests will not run for it. Merge main into $branch over there and resolve the conflict by hand."
+            exit 1
+          fi
 
       - name: Open the mirror pull request if there is none
         if: env.ACTION != 'closed'

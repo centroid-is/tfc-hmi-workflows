@@ -10,12 +10,35 @@ secret (`.github/actions/checkout-source`), so every path in a workflow is
 [`bridge/tfc-hmi-dispatch.yml`](bridge/tfc-hmi-dispatch.yml). Pushes to main
 and tags come as `repository_dispatch`. A pull request comes as a mirror pull
 request: the bridge keeps a branch `tfc-hmi/pr-N` here whose one file,
-`tfc-hmi-source.json`, names the commit to test, force-pushes it on every push
-to the original, opens the mirror PR with no description, and closes it when
-the original closes. tfc-hmi is private and this repository is not, so a
+`tfc-hmi-source.json`, names the commit to test, adds a commit to it on every
+push to the original, opens the mirror PR with no description, and closes it
+when the original closes. tfc-hmi is private and this repository is not, so a
 mirror says only which pull request and which commit: it is titled `pr-N`, and
 neither its commit message nor `tfc-hmi-source.json` carries the original's
 title or branch name.
+
+## A workflow change for one pull request
+
+The bridge appends to a mirror branch and never force-pushes it, so a change
+to CI that belongs with one tfc-hmi pull request can ride on that pull
+request's mirror:
+
+1. Commit the workflow change to `tfc-hmi/pr-N` here (the branch exists once
+   the pull request is open over there) and push it, without forcing.
+2. That push runs `Tests` against the commit `tfc-hmi-source.json` names, with
+   the changed workflows, and the verdict goes to the original as usual. Every
+   later push to the original adds its commit on top and is tested the same way.
+3. Get the change onto `main` here on its own, before the original closes:
+   open a pull request from a branch that carries the workflow commits and not
+   `tfc-hmi-source.json`. Closing or merging the original deletes
+   `tfc-hmi/pr-N`, and merging a mirror itself would put the source file on
+   `main`.
+
+If the change on a mirror comes to conflict with `main` here, GitHub starts no
+runs for the mirror and says nothing. The bridge job in tfc-hmi fails with that
+reason instead; merge `main` into the mirror branch and resolve it by hand.
+A re-run of the bridge for a commit the mirror already names adds nothing and
+starts no run; re-run `Tests` here instead.
 
 ## What runs when
 
