@@ -1,6 +1,6 @@
 name: Check out tfc-hmi
 description: >
-  Checks the private source repository, centroid-is/tfc-hmi, out into `src/`
+  Checks the private source repository, centroid-is/CentroidX (tfc-hmi), out into `src/`
   with the GH_PAT secret, and lets pub reach the private git dependencies
   (open62541_dart, postgresql-dart, board_datetime_picker, cristalyse) through
   the same token. Every job in this repository starts with this action: the
@@ -20,7 +20,7 @@ inputs:
   repository:
     description: The source repository.
     required: false
-    default: centroid-is/tfc-hmi
+    default: centroid-is/CentroidX
   path:
     description: Where to put it, relative to the workspace.
     required: false

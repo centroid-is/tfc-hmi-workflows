@@ -53,11 +53,11 @@ jobs:
           case "$GITHUB_REF" in
             refs/heads/main)
               type=push-main
-              payload=$(jq -nc --arg sha "$GITHUB_SHA" '{sha: $sha}')
+              payload=$(jq -nc --arg repo "$GITHUB_REPOSITORY" --arg sha "$GITHUB_SHA" '{repository: $repo, sha: $sha}')
               ;;
             refs/tags/*)
               type=tag
-              payload=$(jq -nc --arg sha "$GITHUB_SHA" --arg tag "${GITHUB_REF#refs/tags/}" '{sha: $sha, tag: $tag}')
+              payload=$(jq -nc --arg repo "$GITHUB_REPOSITORY" --arg sha "$GITHUB_SHA" --arg tag "${GITHUB_REF#refs/tags/}" '{repository: $repo, sha: $sha, tag: $tag}')
               ;;
             *)
               echo "nothing to dispatch for $GITHUB_REF"

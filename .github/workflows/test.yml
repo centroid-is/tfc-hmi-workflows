@@ -44,30 +44,34 @@ jobs:
       group: ${{ steps.ctx.outputs.group }}
       pr: ${{ steps.ctx.outputs.pr }}
       report: ${{ steps.ctx.outputs.report }}
+      repo: ${{ steps.ctx.outputs.repo }}
     steps:
       - uses: actions/checkout@v4
       - id: ctx
         env:
           DISPATCH_SHA: ${{ github.event.client_payload.sha }}
+          DISPATCH_REPO: ${{ github.event.client_payload.repository }}
           INPUT_REF: ${{ inputs.ref }}
         run: |
-          ref=''; pr=''; report=false
+          ref=''; pr=''; report=false; repo=centroid-is/CentroidX
           if [ "$GITHUB_EVENT_NAME" = pull_request ]; then
             if [ -f tfc-hmi-source.json ]; then
               ref=$(jq -r .sha tfc-hmi-source.json); pr=$(jq -r .pr tfc-hmi-source.json); report=true
+              repo=$(jq -r '.repository // empty' tfc-hmi-source.json); repo=${repo:-centroid-is/CentroidX}
               echo "mirror of tfc-hmi#$pr: $(jq -r .title tfc-hmi-source.json)"
             else
               ref=main
               echo "a pull request of this repository: testing tfc-hmi main against it"
             fi
           elif [ -n "$DISPATCH_SHA" ]; then
-            ref=$DISPATCH_SHA; report=true
+            ref=$DISPATCH_SHA; report=true; repo=${DISPATCH_REPO:-$repo}
           else
             ref=$INPUT_REF
           fi
           echo "ref=$ref" >> "$GITHUB_OUTPUT"
           echo "pr=$pr" >> "$GITHUB_OUTPUT"
           echo "report=$report" >> "$GITHUB_OUTPUT"
+          echo "repo=$repo" >> "$GITHUB_OUTPUT"
           echo "group=${pr:+pr-$pr}" >> "$GITHUB_OUTPUT"
           echo "testing tfc-hmi $ref ${pr:+(PR #$pr)}"
       - name: Report pending to tfc-hmi
@@ -75,7 +79,7 @@ jobs:
         env:
           GH_TOKEN: ${{ secrets.GH_PAT }}
         run: |
-          gh api repos/centroid-is/tfc-hmi/statuses/${{ steps.ctx.outputs.ref }} \
+          gh api repos/${{ steps.ctx.outputs.repo }}/statuses/${{ steps.ctx.outputs.ref }} \
             -f state=pending -f context='tfc-hmi-workflows / tests' \
             -f description='running' \
             -f target_url="$GITHUB_SERVER_URL/$GITHUB_REPOSITORY/actions/runs/$GITHUB_RUN_ID"
@@ -509,7 +513,7 @@ jobs:
           failed=$(echo "$RESULTS" | jq -r 'to_entries[] | select(.value.result != "success" and .key != "context") | .key' | tr '\n' ' ')
           if [ -z "$failed" ]; then state=success; desc='all green'; else state=failure; desc="failed: $failed"; fi
           echo "$state: $desc"
-          gh api repos/centroid-is/tfc-hmi/statuses/${{ needs.context.outputs.ref }} \
+          gh api repos/${{ needs.context.outputs.repo }}/statuses/${{ needs.context.outputs.ref }} \
             -f state="$state" -f context='tfc-hmi-workflows / tests' \
             -f description="${desc:0:130}" \
             -f target_url="$GITHUB_SERVER_URL/$GITHUB_REPOSITORY/actions/runs/$GITHUB_RUN_ID"
