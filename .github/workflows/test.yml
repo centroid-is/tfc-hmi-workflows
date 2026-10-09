@@ -112,6 +112,9 @@ jobs:
           working-directory: src
       - name: flutter test
         working-directory: src
+        env:
+          # test/tools/*_test.dart read the workflows from this repository.
+          CENTROIDX_WORKFLOWS_DIR: ${{ github.workspace }}/.github/workflows
         run: flutter test test/ --file-reporter "json:test-report.json"
       # Goldens are compared on Linux only; none may be skipped there.
       - name: The goldens ran

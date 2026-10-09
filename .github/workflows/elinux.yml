@@ -52,7 +52,6 @@ concurrency:
 
 env:
   TOOLCHAIN: ghcr.io/centroid-is/tfc-toolchain:latest
-  DEFINES: --dart-define=CENTROIDX_CHAT=false --dart-define=CENTROIDX_KNOWLEDGE=false
 
 jobs:
   # Three bundle flavours; a tag build needs only the release one.
@@ -105,9 +104,12 @@ jobs:
           command: flutter-elinux pub get
           working-directory: src/centroid-hmi
 
+      # The defines stay on the command line: tfc-hmi's
+      # test/tools/shipped_feature_flags_test.dart reads this file and checks
+      # every build line for them.
       - name: Build (${{ matrix.mode }})
         working-directory: src/centroid-hmi
-        run: flutter-elinux build elinux --${{ matrix.mode }} $DEFINES
+        run: flutter-elinux build elinux --${{ matrix.mode }} --dart-define=CENTROIDX_CHAT=false --dart-define=CENTROIDX_KNOWLEDGE=false
 
       - name: Collect the bundle
         working-directory: src/centroid-hmi
