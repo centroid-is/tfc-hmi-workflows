@@ -35,6 +35,9 @@ jobs:
   build:
     name: macOS Build
     runs-on: macos-latest
+    # Swift package resolution has hung for an hour with no output; a stuck
+    # build should fail, not hold the Tests verdict until GitHub's 6 h limit.
+    timeout-minutes: 60
     steps:
       - uses: actions/checkout@v4
 
@@ -102,8 +105,24 @@ jobs:
           EOF
           echo '#include "NoSign.xcconfig"' >> Flutter/Release.xcconfig
 
+      # Resolve the Swift packages with the system git and prompts disabled,
+      # so a package that cannot be fetched fails here with its reason instead
+      # of hanging inside `flutter build` behind "Xcode is fetching Swift
+      # Package Manager dependencies".
+      - name: Resolve Swift packages
+        working-directory: src/centroid-hmi/macos
+        timeout-minutes: 15
+        env:
+          GIT_TERMINAL_PROMPT: '0'
+        run: |
+          xcodebuild -resolvePackageDependencies -scmProvider system \
+            -workspace Runner.xcworkspace -scheme Runner 2>&1 | tail -40
+          test "${PIPESTATUS[0]}" -eq 0
+
       - name: Build
         working-directory: src/centroid-hmi
+        env:
+          GIT_TERMINAL_PROMPT: '0'
         run: |
           flutter build macos --release \
             --dart-define=GIT_SHA=${{ steps.src.outputs.sha }} \

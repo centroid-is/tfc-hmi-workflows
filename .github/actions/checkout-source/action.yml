@@ -65,14 +65,18 @@ runs:
     # pubspec.yaml pins git dependencies by https URL under centroid-is/.
     # Those repositories are private, and pub clones them with plain git, so
     # git itself has to carry the token. Global config: pub runs git from the
-    # pub cache, not from inside src/.
+    # pub cache, not from inside src/. The token travels as an HTTP header,
+    # the way actions/checkout does it, rather than as a URL rewrite: Xcode's
+    # Swift Package Manager resolves its packages with its own git (libgit2),
+    # which ignores the header but was seen to hang on a rewritten URL table.
     - name: Let git reach private centroid-is repositories
       shell: bash
       env:
         TOKEN: ${{ inputs.token }}
       run: |
-        git config --global url."https://x-access-token:${TOKEN}@github.com/centroid-is/".insteadOf "https://github.com/centroid-is/"
-        git config --global --add url."https://x-access-token:${TOKEN}@github.com/centroid-is/".insteadOf "git@github.com:centroid-is/"
+        auth="$(printf 'x-access-token:%s' "$TOKEN" | base64 | tr -d '\n')"
+        git config --global "http.https://github.com/.extraheader" "AUTHORIZATION: basic $auth"
+        git config --global url."https://github.com/centroid-is/".insteadOf "git@github.com:centroid-is/"
 
     - name: Resolve the source commit
       id: sha
