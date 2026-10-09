@@ -7,14 +7,18 @@ and the published releases live here.
 Every job starts by checking tfc-hmi out into `src/` with the `GH_PAT`
 secret (`.github/actions/checkout-source`), so every path in a workflow is
 `src/...`. Events arrive from one small workflow inside tfc-hmi,
-[`bridge/tfc-hmi-dispatch.yml`](bridge/tfc-hmi-dispatch.yml), which relays
-pushes, tags and pull requests here as `repository_dispatch`.
+[`bridge/tfc-hmi-dispatch.yml`](bridge/tfc-hmi-dispatch.yml). Pushes to main
+and tags come as `repository_dispatch`. A pull request comes as a mirror pull
+request: the bridge keeps a branch `tfc-hmi/pr-N` here whose one file,
+`tfc-hmi-source.json`, names the commit to test, force-pushes it on every push
+to the original, opens the mirror PR with no description, and closes it when
+the original closes.
 
 ## What runs when
 
 | Event in tfc-hmi | Here | Result |
 |---|---|---|
-| pull request opened or pushed | `Tests` | every test suite, every build, image validation; verdict posted back to the PR as the commit status `tfc-hmi-workflows / tests` |
+| pull request opened or pushed | `Tests`, on the mirror PR `tfc-hmi#N` here | every test suite, every build, image validation; checks on the mirror PR, verdict posted back to the original as the commit status `tfc-hmi-workflows / tests` |
 | push to `main` | `Tests`, `Main Prerelease` | the `main-latest` prerelease of this repository is republished with all assets; `:latest`, `:latest-release` and `:latest-profile` images pushed to ghcr.io |
 | version tag `vYYYY.M.D` pushed | `Tag Release` | version written into `centroid-hmi/pubspec.yaml` and pushed to tfc-hmi main; a release with that tag is created here; `:stable` images pushed |
 | by hand | any workflow, with a `ref` | same as above for that ref; `Station image` can also publish a `station-v*` release of the OS image |
@@ -60,7 +64,7 @@ Set on tfc-hmi:
 
 | Secret | Used for |
 |---|---|
-| `WORKFLOWS_DISPATCH_TOKEN` | the bridge workflow's `repository_dispatch` to this repository (Contents read/write here) |
+| `WORKFLOWS_DISPATCH_TOKEN` | the bridge workflow: `repository_dispatch`, the mirror branches and the mirror pull requests here (Contents and Pull requests read/write on this repository) |
 
 ## Running things by hand
 

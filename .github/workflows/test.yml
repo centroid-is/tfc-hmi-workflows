@@ -1,16 +1,24 @@
 name: Tests
 
 # Everything a pull request of tfc-hmi has to pass, plus the builds it must
-# prove it does not break. Triggered by the bridge workflow in tfc-hmi
-# (repository_dispatch "pull-request" and "push-main") or by hand with a ref.
+# prove it does not break.
 #
-# The verdict goes back to tfc-hmi as a commit status named
-# "tfc-hmi-workflows / tests", set pending at the start and success or failure
-# at the end, with a link to this run. That is what the PR shows.
+# A pull request of tfc-hmi arrives as a mirror pull request here: the bridge
+# workflow in tfc-hmi keeps a branch tfc-hmi/pr-N whose one file,
+# tfc-hmi-source.json, names the commit to test, and force-pushes it on every
+# push over there. So this runs as an ordinary pull_request, with its checks
+# on the mirror PR, and the verdict goes back to tfc-hmi as a commit status
+# named "tfc-hmi-workflows / tests" on the source commit.
+#
+# A pull request of this repository itself, with no source file, tests
+# tfc-hmi main against the changed workflows. Pushes to tfc-hmi main arrive
+# as repository_dispatch "push-main"; a hand run takes any ref.
 
 on:
+  pull_request:
+    branches: [main]
   repository_dispatch:
-    types: [pull-request, push-main]
+    types: [push-main]
   workflow_dispatch:
     inputs:
       ref:
@@ -24,11 +32,8 @@ permissions:
 # A new push to the same PR supersedes the run in flight. Pushes to main and
 # hand runs are never cancelled: verification you never get is worth nothing.
 concurrency:
-  group: tests-${{ github.event.client_payload.pr && format('pr-{0}', github.event.client_payload.pr) || github.run_id }}
+  group: tests-${{ github.event.pull_request.number && format('pr-{0}', github.event.pull_request.number) || github.run_id }}
   cancel-in-progress: true
-
-env:
-  REF: ${{ github.event.client_payload.sha || inputs.ref }}
 
 jobs:
   # One place that turns the event into the inputs every other job reads.
@@ -38,17 +43,35 @@ jobs:
       ref: ${{ steps.ctx.outputs.ref }}
       group: ${{ steps.ctx.outputs.group }}
       pr: ${{ steps.ctx.outputs.pr }}
+      report: ${{ steps.ctx.outputs.report }}
     steps:
+      - uses: actions/checkout@v4
       - id: ctx
+        env:
+          DISPATCH_SHA: ${{ github.event.client_payload.sha }}
+          INPUT_REF: ${{ inputs.ref }}
         run: |
-          ref='${{ github.event.client_payload.sha || inputs.ref }}'
-          pr='${{ github.event.client_payload.pr }}'
+          ref=''; pr=''; report=false
+          if [ "$GITHUB_EVENT_NAME" = pull_request ]; then
+            if [ -f tfc-hmi-source.json ]; then
+              ref=$(jq -r .sha tfc-hmi-source.json); pr=$(jq -r .pr tfc-hmi-source.json); report=true
+              echo "mirror of tfc-hmi#$pr: $(jq -r .title tfc-hmi-source.json)"
+            else
+              ref=main
+              echo "a pull request of this repository: testing tfc-hmi main against it"
+            fi
+          elif [ -n "$DISPATCH_SHA" ]; then
+            ref=$DISPATCH_SHA; report=true
+          else
+            ref=$INPUT_REF
+          fi
           echo "ref=$ref" >> "$GITHUB_OUTPUT"
           echo "pr=$pr" >> "$GITHUB_OUTPUT"
+          echo "report=$report" >> "$GITHUB_OUTPUT"
           echo "group=${pr:+pr-$pr}" >> "$GITHUB_OUTPUT"
           echo "testing tfc-hmi $ref ${pr:+(PR #$pr)}"
       - name: Report pending to tfc-hmi
-        if: github.event_name == 'repository_dispatch'
+        if: steps.ctx.outputs.report == 'true'
         env:
           GH_TOKEN: ${{ secrets.GH_PAT }}
         run: |
@@ -457,7 +480,7 @@ jobs:
 
   # One verdict back to the PR in tfc-hmi.
   report:
-    if: always() && github.event_name == 'repository_dispatch'
+    if: always() && needs.context.outputs.report == 'true'
     needs:
       - context
       - flutter-test
