@@ -296,6 +296,8 @@ jobs:
         if: runner.os == 'macOS'
         run: |
           brew tap timescale/tap || true
+          # Homebrew refuses formulae from third-party taps until the tap is trusted.
+          brew trust timescale/tap || true
           brew install timescale/tap/timescaledb
           PG_FORMULA=$(basename "$(ls -d /opt/homebrew/opt/postgresql@* | sort -V | tail -1)")
           echo "/opt/homebrew/opt/$PG_FORMULA/bin" >> "$GITHUB_PATH"
