@@ -1,0 +1,205 @@
+name: Tag Release
+
+# A stable release. The bridge workflow in tfc-hmi relays a pushed version
+# tag (anything but main-latest and station-v*) as repository_dispatch "tag".
+#
+# 1. The version from the tag is written into centroid-hmi/pubspec.yaml and
+#    pushed to tfc-hmi main with GH_PAT; every build uses that commit.
+# 2. Windows, macOS, the manager, the station images and the stick are built
+#    from it.
+# 3. A release with the same tag is created in THIS repository, which the
+#    app's `stable` update channel and the manager follow. The notes list
+#    tfc-hmi's commits since the previous version tag.
+#
+# Never cancelled: the run holds the only copy of the artifacts, and two
+# close tags each push a version bump to main.
+
+on:
+  repository_dispatch:
+    types: [tag]
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: The version tag in tfc-hmi, e.g. v2026.10.9
+        type: string
+        required: true
+
+permissions:
+  contents: write
+
+concurrency:
+  group: tag-release
+  cancel-in-progress: false
+
+jobs:
+  retag-pubspec:
+    runs-on: ubuntu-latest
+    outputs:
+      tag: ${{ steps.bump.outputs.tag }}
+      ref: ${{ steps.bump.outputs.ref }}
+      previous: ${{ steps.bump.outputs.previous }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: ./.github/actions/checkout-source
+        with:
+          ref: ${{ github.event.client_payload.tag || inputs.tag }}
+          token: ${{ secrets.GH_PAT }}
+          fetch-depth: 0
+
+      # Tag vYYYY.M.D gives version YYYY.M.D+1 and msix_version YYYY.M.D.1;
+      # a tag carrying +N keeps N as the build number.
+      - name: Write the version into pubspec.yaml and push it to main
+        id: bump
+        working-directory: src
+        env:
+          TAG: ${{ github.event.client_payload.tag || inputs.tag }}
+        run: |
+          set -euo pipefail
+          case "$TAG" in main-latest|station-v*) echo "::error::$TAG is not a version tag"; exit 1 ;; esac
+          VERSION=${TAG#v}
+          if [[ "$VERSION" == *+* ]]; then
+            FLUTTER_VERSION=$VERSION; BASE_VERSION=${VERSION%+*}; BUILD_NUMBER=${VERSION#*+}
+          else
+            FLUTTER_VERSION="${VERSION}+1"; BASE_VERSION=$VERSION; BUILD_NUMBER=1
+          fi
+          sed -i "s/^version: .*/version: $FLUTTER_VERSION/" centroid-hmi/pubspec.yaml
+          sed -i "s/^  msix_version: .*/  msix_version: ${BASE_VERSION}.${BUILD_NUMBER}/" centroid-hmi/pubspec.yaml
+          grep -n '^version:\|msix_version:' centroid-hmi/pubspec.yaml
+          previous=$(git describe --tags --abbrev=0 --match 'v*' --exclude "$TAG" "$TAG^" 2>/dev/null || true)
+          git config user.name "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+          if git diff --quiet; then
+            echo "pubspec.yaml already carries $FLUTTER_VERSION"
+          else
+            git add centroid-hmi/pubspec.yaml
+            git commit -m "Update version to $TAG"
+            git push origin HEAD:main
+          fi
+          echo "tag=$TAG" >> "$GITHUB_OUTPUT"
+          echo "ref=$(git rev-parse HEAD)" >> "$GITHUB_OUTPUT"
+          echo "previous=$previous" >> "$GITHUB_OUTPUT"
+
+  elinux-images:
+    needs: retag-pubspec
+    uses: ./.github/workflows/elinux.yml
+    secrets: inherit
+    with:
+      ref: ${{ needs.retag-pubspec.outputs.ref }}
+      publish: tag
+  windows-build:
+    needs: retag-pubspec
+    uses: ./.github/workflows/windows.yml
+    secrets: inherit
+    with:
+      ref: ${{ needs.retag-pubspec.outputs.ref }}
+      stamp_unstable_version: false
+  macos-build:
+    needs: retag-pubspec
+    uses: ./.github/workflows/macos.yml
+    secrets: inherit
+    with:
+      ref: ${{ needs.retag-pubspec.outputs.ref }}
+  manager-build:
+    needs: retag-pubspec
+    uses: ./.github/workflows/manager.yml
+    secrets: inherit
+    with:
+      ref: ${{ needs.retag-pubspec.outputs.ref }}
+  station-image:
+    needs: retag-pubspec
+    uses: ./.github/workflows/station-image.yml
+    secrets: inherit
+    with:
+      ref: ${{ needs.retag-pubspec.outputs.ref }}
+      channel: stable
+      preload: true
+
+  create-release:
+    needs: [retag-pubspec, windows-build, macos-build, manager-build, station-image]
+    if: >-
+      !cancelled() &&
+      needs.retag-pubspec.result == 'success' &&
+      needs.windows-build.result == 'success' &&
+      needs.macos-build.result == 'success' &&
+      needs.manager-build.result == 'success'
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: ./.github/actions/checkout-source
+        with:
+          ref: ${{ needs.retag-pubspec.outputs.ref }}
+          token: ${{ secrets.GH_PAT }}
+          fetch-depth: 0
+      - uses: actions/download-artifact@v4
+        with:
+          path: release/
+          merge-multiple: true
+      - uses: actions/download-artifact@v4
+        with:
+          name: centroid-hmi-windows-portable
+          path: centroidx-windows-x64/
+
+      - name: Assemble the release assets
+        id: assets
+        run: |
+          set -euo pipefail
+          zip -qr release/centroidx_windows_x64.zip centroidx-windows-x64
+          cd release
+          rm -rf centroidx-windows-x64 || true
+          for f in usb-installer.img.gz usb-installer.img.bmap; do
+            if [ ! -f "$f" ]; then
+              found=$(find . -name "$f" | head -1 || true)
+              if [ -n "$found" ]; then mv "$found" "$f"; fi
+            fi
+          done
+          note=''
+          if [ -f usb-installer.img.gz ] && [ "$(stat -c %s usb-installer.img.gz)" -ge 2147483648 ]; then
+            split -b 800000000 -d -a 2 usb-installer.img.gz usb-installer.img.gz.part
+            rm -f usb-installer.img.gz
+            note='> The station USB installer is split past the 2 GiB asset limit. Join it with `cat usb-installer.img.gz.part* > usb-installer.img.gz` before writing it to a stick.'
+          fi
+          shopt -s nullglob
+          msix=( *.msix )
+          if [ "${#msix[@]}" -ne 1 ]; then echo "::error::expected one .msix, found ${msix[*]:-none}"; exit 1; fi
+          [ "${msix[0]}" = centroidx_windows_amd64.msix ] || mv "${msix[0]}" centroidx_windows_amd64.msix
+          sums=( centroidx-manager_* centroidx_darwin_arm64.dmg centroidx_windows_x64.zip centroidx_windows_amd64.msix centroidx-sideload.cer )
+          station=( usb-installer.img.gz* )
+          if [ "${#station[@]}" -gt 0 ] && [ -f usb-installer.img.bmap ]; then
+            sums+=( "${station[@]}" usb-installer.img.bmap )
+          else
+            echo "::warning::no complete station installer in this run"
+            rm -f usb-installer.img.gz* usb-installer.img.bmap
+          fi
+          sha256sum "${sums[@]}" > SHA256SUMS.txt
+          # Anything not on the list is a stray artifact and does not ship.
+          for f in *; do case " ${sums[*]} SHA256SUMS.txt " in *" $f "*) ;; *) rm -rf "$f" ;; esac; done
+          ls -la
+          { echo 'note<<EOF'; echo "$note"; echo 'EOF'; } >> "$GITHUB_OUTPUT"
+
+      - name: Release notes from tfc-hmi's history
+        id: notes
+        working-directory: src
+        env:
+          TAG: ${{ needs.retag-pubspec.outputs.tag }}
+          PREVIOUS: ${{ needs.retag-pubspec.outputs.previous }}
+        run: |
+          {
+            echo "tfc-hmi \`$TAG\` (${{ needs.retag-pubspec.outputs.ref }})"
+            echo
+            if [ -n "$PREVIOUS" ]; then
+              echo "## Changes since $PREVIOUS"
+              echo
+              git log --no-merges --format='- %s' "$PREVIOUS..$TAG"
+            fi
+            echo
+            echo '${{ steps.assets.outputs.note }}'
+          } > "$RUNNER_TEMP/notes.md"
+          cat "$RUNNER_TEMP/notes.md"
+
+      - name: Create the release
+        env:
+          GH_TOKEN: ${{ github.token }}
+          TAG: ${{ needs.retag-pubspec.outputs.tag }}
+        run: |
+          gh release create "$TAG" --repo "$GITHUB_REPOSITORY" --target "$GITHUB_SHA" \
+            --title "$TAG" --notes-file "$RUNNER_TEMP/notes.md" release/*

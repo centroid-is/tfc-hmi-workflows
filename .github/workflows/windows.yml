@@ -1,148 +1,203 @@
-name: Store publish (MSIX via StoreBroker)
+name: Windows MSIX Build
+
+# The Windows build three ways: the sideload MSIX (signed with the Centroid
+# certificate), the portable Release folder, and the public certificate
+# stations put in TrustedPeople. The centroidx-manager executable is built and
+# signed first and bundled into the app's assets, so the copy a station
+# extracts is signed. Called by test.yml (every PR), main-prerelease.yml and
+# tag-release.yml.
 
 on:
+  workflow_call:
+    inputs:
+      ref:
+        description: tfc-hmi commit, branch or tag to build
+        type: string
+        required: true
+      stamp_unstable_version:
+        description: >
+          Stamp an msix_version that sorts below every stable release
+          (0.YYYY.M.run). main-prerelease passes true; tag-release passes
+          false because the version is already committed in pubspec.yaml.
+        type: boolean
+        default: false
+      group:
+        description: Concurrency key; runs sharing it supersede each other (PRs). Empty = never cancelled.
+        type: string
+        default: ''
   workflow_dispatch:
-  push:
-    tags:
-      - '*'
+    inputs:
+      ref:
+        description: tfc-hmi commit, branch or tag to build
+        type: string
+        default: main
+      stamp_unstable_version:
+        type: boolean
+        default: true
 
 permissions:
-  contents: write
-  packages: write
+  contents: read
+
+concurrency:
+  group: windows-${{ inputs.group || github.run_id }}
+  cancel-in-progress: true
 
 jobs:
-  publish:
+  build:
+    name: Windows MSIX Build
     runs-on: windows-latest
-    env:
-      STORE_APP_ID:          ${{ secrets.STORE_PRODUCT_ID }}   # Your app's AppId / StoreId (e.g. 9N1C64WM15R1)
-      STORE_TENANT_ID:       ${{ secrets.STORE_TENANT_ID }}
-      STORE_CLIENT_ID:       ${{ secrets.STORE_CLIENT_ID }}
-      STORE_CLIENT_SECRET:   ${{ secrets.STORE_CLIENT_SECRET }}
-
     steps:
-      - name: Checkout
-        uses: actions/checkout@v4
+      - uses: actions/checkout@v4
+
+      - name: Check out tfc-hmi
+        id: src
+        uses: ./.github/actions/checkout-source
         with:
-          repository: centroid-is/tfc-hmi
+          ref: ${{ inputs.ref }}
           token: ${{ secrets.GH_PAT }}
-          path: tfc-hmi
-          ref: main
 
-      - name: Allow pub to access private Git deps
-        shell: pwsh
+      # go.sum is not at the repository root, so the module cache has to be
+      # told where it is or it never restores.
+      - uses: actions/setup-go@v5
+        with:
+          go-version: '1.26'
+          cache-dependency-path: src/tools/centroidx-manager/go.sum
+
+      - name: Embed the manager's icon and manifest
+        shell: bash
+        working-directory: src/tools/centroidx-manager
+        run: windres --use-temp-file -o centroidx.syso centroidx.rc
+
+      - name: Build centroidx-manager
+        shell: bash
+        working-directory: src/tools/centroidx-manager
+        run: go build -o centroidx-manager_windows_amd64.exe .
+
+      - name: Sign centroidx-manager with the sideload certificate
+        shell: powershell
+        working-directory: src/tools/centroidx-manager
         env:
-          GH_PAT: ${{ secrets.GH_PAT }}
-        run: |
-          git config --global url."https://x-access-token:${env:GH_PAT}@github.com/centroid-is/".insteadOf "https://github.com/centroid-is/"
-
-      - name: Setup Flutter
-        uses: subosito/flutter-action@v2
-        with:
-          channel: stable
-
-      - name: Build Windows
-        working-directory: tfc-hmi/centroid-hmi
-        run: flutter build windows --release
-
-      - name: Create MSIX for Store
-        working-directory: tfc-hmi/centroid-hmi
-        shell: powershell
-        run: |
-          dart run msix:create --store
-
-      - name: Find built MSIX
-        id: pkg
-        working-directory: tfc-hmi/centroid-hmi
-        shell: powershell
-        run: |
-          $msix = Get-ChildItem -Recurse -Filter *.msix | Sort-Object LastWriteTime -Descending | Select-Object -First 1
-          if (-not $msix) { throw "No .msix found" }
-          "msix=$($msix.FullName)" | Out-File -FilePath $env:GITHUB_OUTPUT -Append
-
-      - name: Upload artifact (.msix)  # optional, handy for debugging
-        uses: actions/upload-artifact@v4
-        with:
-          name: sv.msix
-          path: ${{ steps.pkg.outputs.msix }}
-
-      - name: Publish via StoreBroker
-        working-directory: tfc-hmi/centroid-hmi
-        shell: powershell
+          MSIX_CERT_PFX_BASE64: ${{ secrets.MSIX_CERT_PFX_BASE64 }}
+          MSIX_CERT_PASSWORD: ${{ secrets.MSIX_CERT_PASSWORD }}
         run: |
           $ErrorActionPreference = 'Stop'
+          if ([string]::IsNullOrWhiteSpace($env:MSIX_CERT_PFX_BASE64)) { throw "MSIX_CERT_PFX_BASE64 is not set; the manager and the MSIX must be signed." }
+          $pfx = Join-Path $env:RUNNER_TEMP 'signing.pfx'
+          [IO.File]::WriteAllBytes($pfx, [Convert]::FromBase64String($env:MSIX_CERT_PFX_BASE64))
+          $signtool = Get-ChildItem 'C:\Program Files (x86)\Windows Kits\10\bin\*\x64\signtool.exe' | Sort-Object FullName -Descending | Select-Object -First 1
+          if (-not $signtool) { throw "signtool.exe not found in the Windows Kits" }
+          & $signtool.FullName sign /f $pfx /p $env:MSIX_CERT_PASSWORD /fd SHA256 /tr http://timestamp.digicert.com /td SHA256 centroidx-manager_windows_amd64.exe
+          if ($LASTEXITCODE -ne 0) { throw "signtool failed with $LASTEXITCODE" }
+          Remove-Item $pfx -Force
+          $sig = Get-AuthenticodeSignature centroidx-manager_windows_amd64.exe
+          if ($sig.Status -ne 'Valid') { throw "signature status $($sig.Status)" }
+          if ($sig.SignerCertificate.Subject -ne 'CN=Centroid, O=Centroid ehf., C=IS') { throw "unexpected signer $($sig.SignerCertificate.Subject)" }
+          if (-not $sig.TimeStamperCertificate) { throw "signature carries no timestamp" }
+          Write-Host "signed by $($sig.SignerCertificate.Subject), timestamped"
 
-          # Harden PowerShellGet / PSGallery so Install-Module is non-interactive
-          try { [Net.ServicePointManager]::SecurityProtocol = [Net.SecurityProtocolType]::Tls12 } catch {}
-          Install-PackageProvider -Name NuGet -MinimumVersion 2.8.5.201 -Force | Out-Null
-          Set-PSRepository -Name 'PSGallery' -InstallationPolicy Trusted
-          Install-Module StoreBroker -Scope CurrentUser -Force
-          Import-Module StoreBroker
+      - name: Bundle the manager into the app assets
+        shell: bash
+        run: |
+          mkdir -p src/centroid-hmi/assets/manager
+          cp src/tools/centroidx-manager/centroidx-manager_windows_amd64.exe src/centroid-hmi/assets/manager/
 
-          # Validate required secrets early
-          $required = @('STORE_APP_ID','STORE_TENANT_ID','STORE_CLIENT_ID','STORE_CLIENT_SECRET')
-          $missing  = $required | Where-Object {
-            [string]::IsNullOrWhiteSpace([Environment]::GetEnvironmentVariable($_))
-          }
-          if ($missing.Count) { throw "Missing required secrets: $($missing -join ', ')" }
+      - uses: ./.github/actions/setup-flutter
 
-          # Authenticate once; StoreBroker handles token refresh
-          $sec  = ConvertTo-SecureString $env:STORE_CLIENT_SECRET -AsPlainText -Force
-          $cred = New-Object pscredential($env:STORE_CLIENT_ID, $sec)
-          Set-StoreBrokerAuthentication -TenantId $env:STORE_TENANT_ID -Credential $cred
-
-          # Resolve paths explicitly to avoid empty/relative binding issues
-          $ConfigPath = Join-Path (Get-Location) 'submission.json'
-          $OutDir     = Join-Path (Get-Location) 'out'
-          $OutName    = 'package'
-          $MsixPath   = "${{ steps.pkg.outputs.msix }}"
-
-          if (-not (Test-Path $ConfigPath)) {
-            New-StoreBrokerConfigFile -Path $ConfigPath -AppId $env:STORE_APP_ID
-          }
-
-          # Produce package.zip + package.json from the MSIX
-          New-SubmissionPackage -ConfigPath $ConfigPath `
-                                -AppxPath   $MsixPath `
-                                -OutPath    $OutDir `
-                                -OutName    $OutName
-
-          # Create a fresh submission
-          $sub = New-ApplicationSubmission -AppId $env:STORE_APP_ID -Force
-
-          # Upload the ZIP first (required so the service can reference the file)
-          $packageZip = Join-Path $OutDir "$OutName.zip"
-          Set-SubmissionPackage -PackagePath $packageZip -UploadUrl $sub.fileUploadUrl
-
-          # Replace package list with the newly generated ones
-          $sub.applicationPackages | ForEach-Object { $_.fileStatus = 'PendingDelete' }
-          $pkg = Get-Content (Join-Path $OutDir "$OutName.json") -Raw | ConvertFrom-Json
-          $sub.applicationPackages += $pkg.applicationPackages
-
-          # Save updated submission and then commit
-          Set-ApplicationSubmission -AppId $env:STORE_APP_ID -UpdatedSubmission $sub
-          Complete-ApplicationSubmission -AppId $env:STORE_APP_ID -SubmissionId $sub.id
-
-          # After Complete-ApplicationSubmission...
-          $submissionId = $sub.id
-
-          # Poll until we leave the in-progress states
-          $inProgress = @('PendingCommit','CommitStarted','PreProcessing','Certification','PendingPublication','Publishing')
-          $terminalOk = @('Published','Release')
-          $terminalBad = @('CommitFailed','PreProcessingFailed','CertificationFailed','PublishFailed','ReleaseFailed','Canceled')
-
-          do {
-            Start-Sleep -Seconds 30
-            $status = (Get-ApplicationSubmissionStatus -AppId $env:STORE_APP_ID -SubmissionId $submissionId).status
-            Write-Host "Submission $submissionId status: $status"
-          } while ($inProgress -contains $status)
-
-          if ($terminalBad -contains $status) { throw "Store submission failed: $status" }
-          if ($terminalOk  -contains $status) { Write-Host "Store submission completed: $status" }
-          else { Write-Warning "Unexpected terminal status: $status" }
-
-      - name: Upload submission artifacts  # optional, inspect what StoreBroker produced
-        if: always()
-        uses: actions/upload-artifact@v4
+      - uses: ./.github/actions/pub-get
         with:
-          name: store-out
-          path: tfc-hmi/centroid-hmi/out
+          working-directory: src/centroid-hmi
+
+      - name: Build
+        shell: bash
+        working-directory: src/centroid-hmi
+        run: |
+          flutter build windows --release \
+            --dart-define=GIT_SHA=${{ steps.src.outputs.sha }} \
+            --dart-define=CENTROIDX_CHAT=false \
+            --dart-define=CENTROIDX_KNOWLEDGE=false
+
+      - name: Write the certificate PFX from the secret
+        shell: bash
+        working-directory: src/centroid-hmi
+        env:
+          MSIX_CERT_PFX_BASE64: ${{ secrets.MSIX_CERT_PFX_BASE64 }}
+        run: echo "$MSIX_CERT_PFX_BASE64" | base64 --decode > centroidx-sideload.pfx
+
+      # The manager looks for a .cer release asset to put in TrustedPeople;
+      # without it a sideload install fails with 0x800B0109. Exported from the
+      # PFX rather than minted fresh, so it is the certificate the package was
+      # signed with. ASCII only in this script: PowerShell 5.1 reads it as ANSI.
+      - name: Export the public sideload certificate
+        shell: powershell
+        working-directory: src/centroid-hmi
+        env:
+          MSIX_CERT_PASSWORD: ${{ secrets.MSIX_CERT_PASSWORD }}
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $pw = ConvertTo-SecureString $env:MSIX_CERT_PASSWORD -AsPlainText -Force
+          $cert = (Get-PfxData -FilePath centroidx-sideload.pfx -Password $pw).EndEntityCertificates[0]
+          Export-Certificate -Cert $cert -FilePath centroidx-sideload.cer -Type CERT | Out-Null
+          $check = New-Object System.Security.Cryptography.X509Certificates.X509Certificate2((Resolve-Path centroidx-sideload.cer).Path)
+          if ($check.HasPrivateKey) { throw "the exported certificate carries a private key" }
+          if ($check.Subject -ne 'CN=Centroid, O=Centroid ehf., C=IS') { throw "unexpected subject $($check.Subject)" }
+          Write-Host "thumbprint $($check.Thumbprint), valid until $($check.NotAfter)"
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: centroidx-sideload.cer
+          path: src/centroid-hmi/centroidx-sideload.cer
+
+      # A main build must always be an older version than any stable release,
+      # so a station on stable never sees it as an upgrade. 0.YYYY.M.run sorts
+      # below every 2026.x. Per build only, never committed.
+      - name: Stamp an unstable package version
+        if: inputs.stamp_unstable_version
+        shell: bash
+        working-directory: src/centroid-hmi
+        run: |
+          MSIX_VERSION="0.$(date -u +%Y).$(date -u +%-m).${{ github.run_number }}"
+          sed -i "s/^  msix_version: .*/  msix_version: $MSIX_VERSION/" pubspec.yaml
+          grep -n 'msix_version' pubspec.yaml
+
+      # msix:create reruns `flutter build windows`, so the defines ride along.
+      - name: Build MSIX (sideload, signed)
+        shell: powershell
+        working-directory: src/centroid-hmi
+        run: |
+          echo "n" | dart run msix:create --certificate-password "${{ secrets.MSIX_CERT_PASSWORD }}" --windows-build-args "--dart-define=GIT_SHA=${{ steps.src.outputs.sha }} --dart-define=CENTROIDX_CHAT=false --dart-define=CENTROIDX_KNOWLEDGE=false"
+          if ($LASTEXITCODE -ne 0) { throw "msix:create failed with $LASTEXITCODE" }
+
+      - name: Locate and verify the MSIX
+        id: locate
+        shell: powershell
+        working-directory: src/centroid-hmi
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $msix = Get-ChildItem -Recurse -Filter *.msix | Sort-Object LastWriteTime -Descending | Select-Object -First 1
+          if (-not $msix) { throw "No .msix found" }
+          $sig = Get-AuthenticodeSignature $msix.FullName
+          if ($sig.Status -ne 'Valid') { throw "MSIX signature status $($sig.Status)" }
+          Write-Host "$($msix.FullName) $([math]::Round($msix.Length / 1MB)) MB, signed by $($sig.SignerCertificate.Subject)"
+          "msix=$($msix.FullName)" | Out-File -FilePath $env:GITHUB_OUTPUT -Append
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: centroid-hmi.msix
+          path: ${{ steps.locate.outputs.msix }}
+
+      # The portable folder needs the VC++ runtime beside the exe, and must
+      # not carry the 26 MB package msix:create drops into it.
+      - name: Make the Release folder portable
+        shell: powershell
+        working-directory: src/centroid-hmi
+        run: |
+          $release = 'build\windows\x64\runner\Release'
+          foreach ($dll in 'msvcp140.dll', 'vcruntime140.dll', 'vcruntime140_1.dll') {
+            Copy-Item "C:\Windows\System32\$dll" $release
+          }
+          Remove-Item "$release\*.msix" -ErrorAction SilentlyContinue
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: centroid-hmi-windows-portable
+          path: src/centroid-hmi/build/windows/x64/runner/Release/

@@ -1,0 +1,68 @@
+name: Set up Flutter
+description: >
+  Installs the one Flutter version tfc-hmi pins in its `.flutter-version`
+  file, and verifies with the repository's own `scripts/check-flutter-version.sh`
+  that the Flutter on PATH is that version. Every job that needs Flutter goes
+  through here so the version cannot drift between workflows. The golden tests
+  compare rasterised images, and different Flutter versions rasterise the same
+  drawing slightly differently.
+
+  The SDK download is retried once: it dies often enough to matter, and nothing
+  about the repository is involved when it does.
+
+inputs:
+  source:
+    description: The tfc-hmi checkout, as checked out by checkout-source.
+    required: false
+    default: src
+
+outputs:
+  version:
+    description: The Flutter version that was installed.
+    value: ${{ steps.read-version.outputs.version }}
+
+runs:
+  using: composite
+  steps:
+    - name: Read pinned Flutter version
+      id: read-version
+      shell: bash
+      run: |
+        file="$GITHUB_WORKSPACE/${{ inputs.source }}/.flutter-version"
+        if [ ! -f "$file" ]; then
+          echo "::error::$file is missing. The pinned Flutter version lives there."
+          exit 1
+        fi
+        version="$(tr -d '[:space:]' < "$file")"
+        if [ -z "$version" ]; then
+          echo "::error::$file is empty. It must contain exactly one Flutter version."
+          exit 1
+        fi
+        echo "Flutter $version (pinned in .flutter-version)"
+        echo "version=$version" >> "$GITHUB_OUTPUT"
+
+    - name: Install Flutter
+      id: first-attempt
+      uses: subosito/flutter-action@v2
+      continue-on-error: true
+      with:
+        flutter-version: ${{ steps.read-version.outputs.version }}
+
+    - name: Note the retry
+      if: steps.first-attempt.outcome == 'failure'
+      shell: bash
+      run: |
+        echo "::warning::Installing Flutter ${{ steps.read-version.outputs.version }} failed on the first attempt. Retrying once; this is the SDK download, not anything in the repository."
+
+    - name: Install Flutter (retry)
+      if: steps.first-attempt.outcome == 'failure'
+      uses: subosito/flutter-action@v2
+      with:
+        flutter-version: ${{ steps.read-version.outputs.version }}
+
+    # The same script developers run locally, so CI exercises it on every run
+    # and it cannot quietly rot into always passing.
+    - name: Verify the installed Flutter matches the pin
+      shell: bash
+      working-directory: ${{ inputs.source }}
+      run: bash scripts/check-flutter-version.sh

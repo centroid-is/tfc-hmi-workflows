@@ -1,0 +1,272 @@
+name: Build centroidx-manager
+
+# The Go updater that stations and desktops run. Three binaries (Windows,
+# Linux, macOS DMG), unit tests on two platforms, and integration tests that
+# resolve "the latest release" off the live Releases API of this repository.
+# Called by test.yml (every PR), main-prerelease.yml and tag-release.yml.
+
+on:
+  workflow_call:
+    inputs:
+      ref:
+        description: tfc-hmi commit, branch or tag to build
+        type: string
+        required: true
+      run_integration_tests:
+        description: >
+          The integration tests download from the current latest release. A
+          caller about to replace that release (main-prerelease) must not be
+          gated on them: a bad release would block the run that fixes it.
+        type: boolean
+        default: true
+      group:
+        description: Concurrency key; runs sharing it supersede each other (PRs). Empty = never cancelled.
+        type: string
+        default: ''
+  workflow_dispatch:
+    inputs:
+      ref:
+        description: tfc-hmi commit, branch or tag to build
+        type: string
+        default: main
+      run_integration_tests:
+        type: boolean
+        default: true
+
+permissions:
+  contents: read
+
+concurrency:
+  group: manager-${{ inputs.group || github.run_id }}
+  cancel-in-progress: true
+
+env:
+  GIO_APT_DEPS: gcc pkg-config libwayland-dev libx11-dev libx11-xcb-dev libxkbcommon-x11-dev libgles2-mesa-dev libegl1-mesa-dev libffi-dev libxcursor-dev libxrandr-dev libxinerama-dev libxi-dev libxxf86vm-dev libvulkan-dev
+
+jobs:
+  build:
+    name: manager (${{ matrix.goos }}/${{ matrix.goarch }})
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: windows-latest
+            goos: windows
+            goarch: amd64
+            artifact_name: centroidx-manager_windows_amd64.exe
+            cgo: '0'
+          - os: ubuntu-latest
+            goos: linux
+            goarch: amd64
+            artifact_name: centroidx-manager_linux_amd64
+            cgo: '1'
+          - os: macos-latest
+            goos: darwin
+            goarch: arm64
+            artifact_name: centroidx-manager_darwin_arm64.dmg
+            binary_name: centroidx-manager
+            cgo: '1'
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Check out tfc-hmi
+        uses: ./.github/actions/checkout-source
+        with:
+          ref: ${{ inputs.ref }}
+          token: ${{ secrets.GH_PAT }}
+
+      - uses: actions/setup-go@v5
+        with:
+          go-version: '1.26'
+          cache-dependency-path: src/tools/centroidx-manager/go.sum
+
+      - name: Install Gio build dependencies
+        if: runner.os == 'Linux'
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y $GIO_APT_DEPS
+
+      - name: Embed the icon and manifest
+        if: runner.os == 'Windows'
+        shell: bash
+        working-directory: src/tools/centroidx-manager
+        run: windres --use-temp-file -o centroidx.syso centroidx.rc
+
+      - name: Build
+        shell: bash
+        working-directory: src/tools/centroidx-manager
+        env:
+          CGO_ENABLED: ${{ matrix.cgo }}
+        run: go build -o "${{ matrix.binary_name || matrix.artifact_name }}" .
+
+      - name: Sign the manager executable
+        if: runner.os == 'Windows' && env.MSIX_CERT_PFX_BASE64 != ''
+        shell: powershell
+        working-directory: src/tools/centroidx-manager
+        env:
+          MSIX_CERT_PFX_BASE64: ${{ secrets.MSIX_CERT_PFX_BASE64 }}
+          MSIX_CERT_PASSWORD: ${{ secrets.MSIX_CERT_PASSWORD }}
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $pfx = Join-Path $env:RUNNER_TEMP 'signing.pfx'
+          [IO.File]::WriteAllBytes($pfx, [Convert]::FromBase64String($env:MSIX_CERT_PFX_BASE64))
+          $signtool = Get-ChildItem 'C:\Program Files (x86)\Windows Kits\10\bin\*\x64\signtool.exe' | Sort-Object FullName -Descending | Select-Object -First 1
+          if (-not $signtool) { throw "signtool.exe not found in the Windows Kits" }
+          & $signtool.FullName sign /f $pfx /p $env:MSIX_CERT_PASSWORD /fd SHA256 /tr http://timestamp.digicert.com /td SHA256 "${{ matrix.artifact_name }}"
+          if ($LASTEXITCODE -ne 0) { throw "signtool failed with $LASTEXITCODE" }
+          Remove-Item $pfx -Force
+          $sig = Get-AuthenticodeSignature "${{ matrix.artifact_name }}"
+          if ($sig.Status -ne 'Valid') { throw "signature status $($sig.Status)" }
+          if ($sig.SignerCertificate.Subject -ne 'CN=Centroid, O=Centroid ehf., C=IS') { throw "unexpected signer $($sig.SignerCertificate.Subject)" }
+          if (-not $sig.TimeStamperCertificate) { throw "signature carries no timestamp" }
+
+      - name: Package the macOS app bundle
+        if: runner.os == 'macOS'
+        working-directory: src/tools/centroidx-manager
+        run: |
+          APP="CentroidX-Manager.app"
+          mkdir -p "$APP/Contents/MacOS" "$APP/Contents/Resources"
+          cp centroidx-manager "$APP/Contents/MacOS/centroidx-manager"
+          cp Info.plist "$APP/Contents/Info.plist"
+          cp icon.icns "$APP/Contents/Resources/icon.icns"
+          chmod +x "$APP/Contents/MacOS/centroidx-manager"
+
+      - name: Sign and notarize macOS app bundle
+        if: runner.os == 'macOS' && env.APPLE_CERTIFICATE_P12_BASE64 != ''
+        working-directory: src/tools/centroidx-manager
+        env:
+          APPLE_CERTIFICATE_P12_BASE64: ${{ secrets.APPLE_CERTIFICATE_P12_BASE64 }}
+          APPLE_CERTIFICATE_PASSWORD: ${{ secrets.APPLE_CERTIFICATE_PASSWORD }}
+          APPLE_TEAM_ID: ${{ secrets.APPLE_TEAM_ID }}
+          APPLE_ID: ${{ secrets.APPLE_ID }}
+          APPLE_ID_PASSWORD: ${{ secrets.APPLE_ID_PASSWORD }}
+        run: |
+          APP="CentroidX-Manager.app"
+          KEYCHAIN_PATH="$RUNNER_TEMP/signing.keychain-db"
+          KEYCHAIN_PASSWORD="$(openssl rand -hex 16)"
+          CERT_PATH="$RUNNER_TEMP/certificate.p12"
+          echo "$APPLE_CERTIFICATE_P12_BASE64" | base64 --decode > "$CERT_PATH"
+          security create-keychain -p "$KEYCHAIN_PASSWORD" "$KEYCHAIN_PATH"
+          security set-keychain-settings -lut 21600 "$KEYCHAIN_PATH"
+          security unlock-keychain -p "$KEYCHAIN_PASSWORD" "$KEYCHAIN_PATH"
+          security import "$CERT_PATH" -P "$APPLE_CERTIFICATE_PASSWORD" -A -t cert -f pkcs12 -k "$KEYCHAIN_PATH"
+          security list-keychains -d user -s "$KEYCHAIN_PATH" login.keychain
+          security set-key-partition-list -S apple-tool:,apple: -s -k "$KEYCHAIN_PASSWORD" "$KEYCHAIN_PATH"
+          rm -f "$CERT_PATH"
+          IDENTITY="$(security find-identity -v -p codesigning "$KEYCHAIN_PATH" | grep 'Developer ID Application' | head -1 | awk -F'"' '{print $2}')"
+          codesign --force --options runtime --sign "$IDENTITY" --timestamp --deep "$APP"
+          codesign --verify --deep --strict "$APP"
+          rm -rf dmg-staging && mkdir dmg-staging && cp -R "$APP" dmg-staging/
+          bash "$GITHUB_WORKSPACE/.github/scripts/create-dmg.sh" "CentroidX Manager" dmg-staging "${{ matrix.artifact_name }}"
+          codesign --force --sign "$IDENTITY" --timestamp "${{ matrix.artifact_name }}"
+          if xcrun notarytool submit "${{ matrix.artifact_name }}" --apple-id "$APPLE_ID" --password "$APPLE_ID_PASSWORD" --team-id "$APPLE_TEAM_ID" --wait; then
+            xcrun stapler staple "${{ matrix.artifact_name }}"
+          else
+            echo "::warning title=Notarization failed::the manager DMG is signed but not notarized"
+          fi
+          security delete-keychain "$KEYCHAIN_PATH" || true
+
+      - name: Create unsigned DMG (when signing is not available)
+        if: runner.os == 'macOS' && env.APPLE_CERTIFICATE_P12_BASE64 == ''
+        working-directory: src/tools/centroidx-manager
+        env:
+          APPLE_CERTIFICATE_P12_BASE64: ${{ secrets.APPLE_CERTIFICATE_P12_BASE64 }}
+        run: |
+          rm -rf dmg-staging && mkdir dmg-staging && cp -R CentroidX-Manager.app dmg-staging/
+          bash "$GITHUB_WORKSPACE/.github/scripts/create-dmg.sh" "CentroidX Manager" dmg-staging "${{ matrix.artifact_name }}"
+
+      - name: Show the artifact
+        shell: bash
+        working-directory: src/tools/centroidx-manager
+        run: ls -la "${{ matrix.artifact_name }}"
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: ${{ matrix.artifact_name }}
+          path: src/tools/centroidx-manager/${{ matrix.artifact_name }}
+
+  # Hermetic and fast, and a unit failure should block main-prerelease, so
+  # these are not gated on run_integration_tests. No macOS leg: runners are
+  # scarce and the Windows leg is what compiles extract_windows_test.go.
+  unit-test:
+    name: manager-unit-test (${{ matrix.os }})
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: ubuntu-latest
+            cgo: '1'
+          - os: windows-latest
+            cgo: '0'
+    steps:
+      - uses: actions/checkout@v4
+      - uses: ./.github/actions/checkout-source
+        with:
+          ref: ${{ inputs.ref }}
+          token: ${{ secrets.GH_PAT }}
+      - uses: actions/setup-go@v5
+        with:
+          go-version: '1.26'
+          cache-dependency-path: src/tools/centroidx-manager/go.sum
+      - name: Install Gio build dependencies
+        if: runner.os == 'Linux'
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y $GIO_APT_DEPS
+      # Windows runners are elevated, so TestWritable's premise fails there.
+      - name: go test
+        shell: bash
+        working-directory: src/tools/centroidx-manager
+        env:
+          CGO_ENABLED: ${{ matrix.cgo }}
+          CENTROIDX_TEST_ELEVATED: ${{ runner.os == 'Windows' && '1' || '' }}
+        run: go test ./...
+
+  integration-test:
+    name: manager-integration-test (${{ matrix.os }})
+    needs: [build]
+    if: inputs.run_integration_tests
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: windows-latest
+            cgo: '0'
+          - os: ubuntu-latest
+            cgo: '1'
+          - os: macos-latest
+            cgo: '1'
+    steps:
+      - uses: actions/checkout@v4
+      - uses: ./.github/actions/checkout-source
+        with:
+          ref: ${{ inputs.ref }}
+          token: ${{ secrets.GH_PAT }}
+      - uses: actions/setup-go@v5
+        with:
+          go-version: '1.26'
+          cache-dependency-path: src/tools/centroidx-manager/go.sum
+      - name: Install Gio build dependencies
+        if: runner.os == 'Linux'
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y $GIO_APT_DEPS
+      # The update tests resolve "latest release" from the live Releases API
+      # of the repository the manager points at (this one, once tfc-hmi's
+      # main.go names it).
+      - name: Update integration tests
+        shell: bash
+        working-directory: src/tools/centroidx-manager
+        env:
+          CGO_ENABLED: ${{ matrix.cgo }}
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: go test -tags integration -v -timeout 300s ./internal/update/ -run TestIntegration
+      - name: Platform integration tests
+        shell: bash
+        working-directory: src/tools/centroidx-manager
+        env:
+          CGO_ENABLED: ${{ matrix.cgo }}
+        run: go test -tags integration -v -timeout 120s ./internal/platform/ -run TestIntegration

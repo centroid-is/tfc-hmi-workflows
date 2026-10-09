@@ -1,0 +1,254 @@
+name: Embedded Linux images
+
+# The station images on ghcr.io: centroid-hmi (the flutter-elinux bundle in
+# docker/frontend), centroid-backend (docker/backend) and hmi-profiler
+# (docker/profiler). Which tags are pushed depends on `publish`:
+#
+#   pr    centroid-hmi:pr-N, centroid-backend:pr-N, hmi-profiler:pr-N
+#   main  :<sha> and :latest (a DEBUG Flutter build), plus :<sha>-release /
+#         :latest-release (production mode) and :<sha>-profile /
+#         :latest-profile (Dart VM service kept, for docker/profiler)
+#   tag   :<sha> and :stable, built in release mode
+#
+# Called by test.yml (pr), main-prerelease.yml (main) and tag-release.yml (tag).
+
+on:
+  workflow_call:
+    inputs:
+      ref:
+        description: tfc-hmi commit, branch or tag to build
+        type: string
+        required: true
+      publish:
+        description: pr | main | tag (see above)
+        type: string
+        required: true
+      pr_number:
+        description: Pull request number, for the pr-N tags
+        type: string
+        default: ''
+      group:
+        description: Concurrency key; runs sharing it supersede each other (PRs). Empty = never cancelled.
+        type: string
+        default: ''
+  workflow_dispatch:
+    inputs:
+      ref:
+        description: tfc-hmi commit, branch or tag to build
+        type: string
+        default: main
+      publish:
+        description: pr | main | tag. "pr" with no number builds and pushes nothing.
+        type: choice
+        options: [pr, main, tag]
+        default: pr
+
+permissions:
+  contents: read
+
+concurrency:
+  group: elinux-${{ inputs.group || github.run_id }}
+  cancel-in-progress: true
+
+env:
+  TOOLCHAIN: ghcr.io/centroid-is/tfc-toolchain:latest
+  DEFINES: --dart-define=CENTROIDX_CHAT=false --dart-define=CENTROIDX_KNOWLEDGE=false
+
+jobs:
+  # Three bundle flavours; a tag build needs only the release one.
+  elinux-build:
+    name: flutter-elinux (${{ matrix.mode }})
+    runs-on: ubuntu-latest
+    container:
+      image: ghcr.io/centroid-is/tfc-toolchain:latest
+      credentials:
+        username: ${{ github.actor }}
+        password: ${{ secrets.GH_PAT }}
+    strategy:
+      fail-fast: false
+      matrix:
+        mode: ${{ inputs.publish == 'tag' && fromJSON('["release"]') || (inputs.publish == 'main' && fromJSON('["debug","release","profile"]') || fromJSON('["debug"]')) }}
+    outputs:
+      sha: ${{ steps.src.outputs.short_sha }}
+    steps:
+      - run: git config --system --add safe.directory '*'
+      - uses: actions/checkout@v4
+      - name: Check out tfc-hmi
+        id: src
+        uses: ./.github/actions/checkout-source
+        with:
+          ref: ${{ inputs.ref }}
+          token: ${{ secrets.GH_PAT }}
+
+      # Upstream flutter-elinux at 3.47.0 carries its own native-asset hook
+      # support, shadowing the toolchain image's baked copy. If this stays
+      # green the pin moves into tfc-toolchain and this step goes away.
+      - name: Use upstream flutter-elinux 3.47.0
+        run: |
+          git clone https://github.com/flutter-elinux/flutter-elinux.git /opt/flutter-elinux-347
+          git -C /opt/flutter-elinux-347 checkout 4d63880dfaba6e30530b88f2344e0a7b870228b2
+          echo "/opt/flutter-elinux-347/bin" >> "$GITHUB_PATH"
+
+      - name: Create the elinux platform folder
+        working-directory: src/centroid-hmi
+        run: flutter-elinux create --platforms=elinux .
+
+      # libcef.so needs ALSA and NSS/NSPR at link time; libasound2t64 is the
+      # name after trixie's t64 transition.
+      - name: Install CEF link dependencies
+        run: |
+          apt-get update -qq
+          DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends libnss3 libnspr4 libasound2t64
+
+      - uses: ./.github/actions/pub-get
+        with:
+          command: flutter-elinux pub get
+          working-directory: src/centroid-hmi
+
+      - name: Build (${{ matrix.mode }})
+        working-directory: src/centroid-hmi
+        run: flutter-elinux build elinux --${{ matrix.mode }} $DEFINES
+
+      - name: Collect the bundle
+        working-directory: src/centroid-hmi
+        run: |
+          mkdir -p assets
+          mv build/elinux/x64/${{ matrix.mode }}/bundle/* assets/
+
+      # The VM Service RPC table string is present in a profile engine and
+      # absent in a release one.
+      - name: Verify the engine really is a profile build
+        if: matrix.mode == 'profile'
+        working-directory: src/centroid-hmi
+        run: |
+          if ! grep -a -q getCpuSamples assets/lib/libflutter_engine.so; then
+            echo "::error::libflutter_engine.so carries no VM service; this is not a profile engine"
+            exit 1
+          fi
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: centroid-hmi-bundle-${{ matrix.mode }}
+          path: src/centroid-hmi/assets/
+
+  frontend-image:
+    name: centroid-hmi image (${{ matrix.mode }})
+    needs: elinux-build
+    if: inputs.publish != 'pr' || inputs.pr_number != ''
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        mode: ${{ inputs.publish == 'tag' && fromJSON('["release"]') || (inputs.publish == 'main' && fromJSON('["debug","release","profile"]') || fromJSON('["debug"]')) }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: ./.github/actions/checkout-source
+        with:
+          ref: ${{ inputs.ref }}
+          token: ${{ secrets.GH_PAT }}
+      - uses: actions/download-artifact@v4
+        with:
+          name: centroid-hmi-bundle-${{ matrix.mode }}
+          path: src/docker/frontend/bundle
+      - uses: ./.github/actions/ghcr-login
+        with:
+          token: ${{ secrets.GH_PAT }}
+      - name: Choose the tags
+        id: tags
+        env:
+          SHA: ${{ needs.elinux-build.outputs.sha }}
+          IMG: ghcr.io/centroid-is/centroid-hmi
+        run: |
+          case "${{ inputs.publish }}-${{ matrix.mode }}" in
+            pr-debug)      tags="$IMG:pr-${{ inputs.pr_number }}" ;;
+            main-debug)    tags="$IMG:$SHA"$'\n'"$IMG:latest" ;;
+            main-release)  tags="$IMG:$SHA-release"$'\n'"$IMG:latest-release" ;;
+            main-profile)  tags="$IMG:$SHA-profile"$'\n'"$IMG:latest-profile" ;;
+            tag-release)   tags="$IMG:$SHA"$'\n'"$IMG:stable" ;;
+            *) echo "::error::no tags for ${{ inputs.publish }}/${{ matrix.mode }}"; exit 1 ;;
+          esac
+          { echo 'tags<<EOF'; echo "$tags"; echo 'EOF'; } >> "$GITHUB_OUTPUT"
+      - uses: ./.github/actions/docker-build-push
+        with:
+          context: src/docker/frontend
+          build-args: |
+            APP_BIN=centroidx
+            APP_BUNDLE=bundle
+          tags: ${{ steps.tags.outputs.tags }}
+
+  # The backend's -profile variant is a named stage of the same Dockerfile;
+  # built in the same job so it reuses the open62541 layers instead of
+  # rebuilding them on a second runner.
+  backend-image:
+    name: centroid-backend image
+    if: inputs.publish != 'pr' || inputs.pr_number != ''
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - id: src
+        uses: ./.github/actions/checkout-source
+        with:
+          ref: ${{ inputs.ref }}
+          token: ${{ secrets.GH_PAT }}
+      - uses: ./.github/actions/ghcr-login
+        with:
+          token: ${{ secrets.GH_PAT }}
+      - name: Choose the tags
+        id: tags
+        env:
+          SHA: ${{ steps.src.outputs.short_sha }}
+          IMG: ghcr.io/centroid-is/centroid-backend
+        run: |
+          case "${{ inputs.publish }}" in
+            pr)   tags="$IMG:pr-${{ inputs.pr_number }}" ;;
+            main) tags="$IMG:$SHA"$'\n'"$IMG:latest" ;;
+            tag)  tags="$IMG:$SHA"$'\n'"$IMG:stable" ;;
+          esac
+          { echo 'tags<<EOF'; echo "$tags"; echo 'EOF'; } >> "$GITHUB_OUTPUT"
+          { echo 'profile<<EOF'; echo "$IMG:$SHA-profile"; echo "$IMG:latest-profile"; echo 'EOF'; } >> "$GITHUB_OUTPUT"
+      - uses: ./.github/actions/docker-build-push
+        with:
+          context: src
+          file: src/docker/backend/Dockerfile
+          tags: ${{ steps.tags.outputs.tags }}
+      - if: inputs.publish == 'main'
+        uses: ./.github/actions/docker-build-push
+        with:
+          context: src
+          file: src/docker/backend/Dockerfile
+          target: profile
+          tags: ${{ steps.tags.outputs.profile }}
+
+  # python:alpine plus a stdlib script; built on every PR so docker/profiler
+  # does not rot.
+  profiler-image:
+    name: hmi-profiler image
+    if: inputs.publish != 'pr' || inputs.pr_number != ''
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - id: src
+        uses: ./.github/actions/checkout-source
+        with:
+          ref: ${{ inputs.ref }}
+          token: ${{ secrets.GH_PAT }}
+      - uses: ./.github/actions/ghcr-login
+        with:
+          token: ${{ secrets.GH_PAT }}
+      - name: Choose the tags
+        id: tags
+        env:
+          SHA: ${{ steps.src.outputs.short_sha }}
+          IMG: ghcr.io/centroid-is/hmi-profiler
+        run: |
+          case "${{ inputs.publish }}" in
+            pr)   tags="$IMG:pr-${{ inputs.pr_number }}" ;;
+            main) tags="$IMG:$SHA"$'\n'"$IMG:latest" ;;
+            tag)  tags="$IMG:$SHA"$'\n'"$IMG:stable" ;;
+          esac
+          { echo 'tags<<EOF'; echo "$tags"; echo 'EOF'; } >> "$GITHUB_OUTPUT"
+      - uses: ./.github/actions/docker-build-push
+        with:
+          context: src
+          file: src/docker/profiler/Dockerfile
+          tags: ${{ steps.tags.outputs.tags }}

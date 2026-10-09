@@ -1,0 +1,493 @@
+name: Tests
+
+# Everything a pull request of tfc-hmi has to pass, plus the builds it must
+# prove it does not break. Triggered by the bridge workflow in tfc-hmi
+# (repository_dispatch "pull-request" and "push-main") or by hand with a ref.
+#
+# The verdict goes back to tfc-hmi as a commit status named
+# "tfc-hmi-workflows / tests", set pending at the start and success or failure
+# at the end, with a link to this run. That is what the PR shows.
+
+on:
+  repository_dispatch:
+    types: [pull-request, push-main]
+  workflow_dispatch:
+    inputs:
+      ref:
+        description: tfc-hmi commit, branch or tag to test
+        type: string
+        default: main
+
+permissions:
+  contents: read
+
+# A new push to the same PR supersedes the run in flight. Pushes to main and
+# hand runs are never cancelled: verification you never get is worth nothing.
+concurrency:
+  group: tests-${{ github.event.client_payload.pr && format('pr-{0}', github.event.client_payload.pr) || github.run_id }}
+  cancel-in-progress: true
+
+env:
+  REF: ${{ github.event.client_payload.sha || inputs.ref }}
+
+jobs:
+  # One place that turns the event into the inputs every other job reads.
+  context:
+    runs-on: ubuntu-latest
+    outputs:
+      ref: ${{ steps.ctx.outputs.ref }}
+      group: ${{ steps.ctx.outputs.group }}
+      pr: ${{ steps.ctx.outputs.pr }}
+    steps:
+      - id: ctx
+        run: |
+          ref='${{ github.event.client_payload.sha || inputs.ref }}'
+          pr='${{ github.event.client_payload.pr }}'
+          echo "ref=$ref" >> "$GITHUB_OUTPUT"
+          echo "pr=$pr" >> "$GITHUB_OUTPUT"
+          echo "group=${pr:+pr-$pr}" >> "$GITHUB_OUTPUT"
+          echo "testing tfc-hmi $ref ${pr:+(PR #$pr)}"
+      - name: Report pending to tfc-hmi
+        if: github.event_name == 'repository_dispatch'
+        env:
+          GH_TOKEN: ${{ secrets.GH_PAT }}
+        run: |
+          gh api repos/centroid-is/tfc-hmi/statuses/${{ steps.ctx.outputs.ref }} \
+            -f state=pending -f context='tfc-hmi-workflows / tests' \
+            -f description='running' \
+            -f target_url="$GITHUB_SERVER_URL/$GITHUB_REPOSITORY/actions/runs/$GITHUB_RUN_ID"
+
+  flutter-test:
+    name: flutter-test (${{ matrix.os }})
+    needs: context
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-latest, windows-latest]
+    steps:
+      - uses: actions/checkout@v4
+      - uses: ./.github/actions/checkout-source
+        with:
+          ref: ${{ needs.context.outputs.ref }}
+          token: ${{ secrets.GH_PAT }}
+      - name: Preference-store construction gate
+        if: runner.os == 'Linux'
+        working-directory: src
+        run: |
+          bash scripts/check-preferences-construction.sh
+          bash scripts/check-flutter-preferences-retired.sh
+      - uses: ./.github/actions/setup-flutter
+      - if: runner.os == 'Linux'
+        run: sudo apt-get install -y libglib2.0-dev
+      - uses: ./.github/actions/pub-get
+        with:
+          working-directory: src
+      - name: flutter test
+        working-directory: src
+        run: flutter test test/ --file-reporter "json:test-report.json"
+      # Goldens are compared on Linux only; none may be skipped there.
+      - name: The goldens ran
+        if: always()
+        working-directory: src
+        run: bash scripts/check-goldens-ran.sh
+      - if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: golden-failures-${{ matrix.os }}
+          path: src/**/failures/**
+          if-no-files-found: ignore
+          retention-days: 7
+
+  centroid-hmi-test:
+    name: centroid-hmi-test (${{ matrix.os }})
+    needs: context
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-latest, windows-latest]
+    steps:
+      - uses: actions/checkout@v4
+      - uses: ./.github/actions/checkout-source
+        with:
+          ref: ${{ needs.context.outputs.ref }}
+          token: ${{ secrets.GH_PAT }}
+      - uses: ./.github/actions/setup-flutter
+      - if: runner.os == 'Linux'
+        run: sudo apt-get install -y libglib2.0-dev
+      - uses: ./.github/actions/pub-get
+        with:
+          working-directory: src/centroid-hmi
+      - working-directory: src/centroid-hmi
+        run: flutter test test/ --file-reporter "json:test-report.json"
+      # Pointing at the wrong package produces a passing run of nothing.
+      - name: At least 15 tests ran
+        if: always()
+        shell: bash
+        working-directory: src/centroid-hmi
+        run: |
+          total=$(grep -o '"type":"testStart"' test-report.json | wc -l)
+          loading=$(grep -o '"name":"loading ' test-report.json | wc -l)
+          ran=$((total - loading))
+          echo "$ran tests ran"
+          [ "$ran" -ge 15 ]
+
+  dart-packages:
+    name: ${{ matrix.package }} (${{ matrix.os }})
+    needs: context
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-latest, windows-latest]
+        package: [modbus_client, modbus_client_tcp, tfc_mcp_server, tfc_access]
+    steps:
+      - uses: actions/checkout@v4
+      - uses: ./.github/actions/checkout-source
+        with:
+          ref: ${{ needs.context.outputs.ref }}
+          token: ${{ secrets.GH_PAT }}
+      - uses: dart-lang/setup-dart@v1
+      - uses: ./.github/actions/pub-get
+        with:
+          command: dart pub get
+          working-directory: src/packages/${{ matrix.package }}
+      # tfc_access has a purity suite that fails if it gains a tfc_dart or
+      # open62541 dependency, so it is analysed as well.
+      - if: matrix.package == 'tfc_access'
+        working-directory: src/packages/${{ matrix.package }}
+        run: dart analyze
+      - working-directory: src/packages/${{ matrix.package }}
+        run: dart test
+
+  jbtm-test:
+    name: jbtm-test (${{ matrix.os }})
+    needs: context
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-latest, windows-latest]
+    steps:
+      - uses: actions/checkout@v4
+      - uses: ./.github/actions/checkout-source
+        with:
+          ref: ${{ needs.context.outputs.ref }}
+          token: ${{ secrets.GH_PAT }}
+      - uses: dart-lang/setup-dart@v1
+      - uses: ./.github/actions/pub-get
+        with:
+          command: dart pub get
+          working-directory: src/packages/jbtm
+      - working-directory: src/packages/jbtm
+        run: dart test --file-reporter "json:test-report.json"
+      - name: At least 220 tests ran
+        if: always()
+        shell: bash
+        working-directory: src/packages/jbtm
+        run: |
+          ran=$(grep -o '"type":"testStart"' test-report.json | wc -l)
+          echo "$ran tests ran"
+          [ "$ran" -ge 220 ]
+
+  plant-sim-test:
+    needs: context
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: ./.github/actions/checkout-source
+        with:
+          ref: ${{ needs.context.outputs.ref }}
+          token: ${{ secrets.GH_PAT }}
+      - uses: dart-lang/setup-dart@v1
+      - uses: ./.github/actions/pub-get
+        with:
+          command: dart pub get
+          working-directory: src/packages/tfc_plant_sim
+      - working-directory: src/packages/tfc_plant_sim
+        run: |
+          dart analyze
+          dart test
+
+  centroidx-upgrader-test:
+    name: centroidx-upgrader-test (${{ matrix.os }})
+    needs: context
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-latest, windows-latest]
+    steps:
+      - uses: actions/checkout@v4
+      - uses: ./.github/actions/checkout-source
+        with:
+          ref: ${{ needs.context.outputs.ref }}
+          token: ${{ secrets.GH_PAT }}
+      - uses: ./.github/actions/setup-flutter
+      - uses: ./.github/actions/pub-get
+        with:
+          working-directory: src/packages/centroidx_upgrader
+      - working-directory: src/packages/centroidx_upgrader
+        run: flutter test
+
+  tfc-dart-test:
+    name: tfc-dart-test (${{ matrix.os }})
+    needs: context
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: ubuntu-latest
+            timescaledb_external: ''
+          - os: macos-latest
+            timescaledb_external: '1'
+          - os: windows-latest
+            timescaledb_external: '1'
+    steps:
+      - uses: actions/checkout@v4
+      - uses: ./.github/actions/checkout-source
+        with:
+          ref: ${{ needs.context.outputs.ref }}
+          token: ${{ secrets.GH_PAT }}
+      - uses: dart-lang/setup-dart@v1
+
+      # Ubuntu runs TimescaleDB in Docker from the tests themselves; the other
+      # two have no Docker and get a native server on localhost instead.
+      - name: TimescaleDB (macOS)
+        if: runner.os == 'macOS'
+        run: |
+          brew tap timescale/tap || true
+          brew install timescale/tap/timescaledb
+          PG_FORMULA=$(basename "$(ls -d /opt/homebrew/opt/postgresql@* | sort -V | tail -1)")
+          echo "/opt/homebrew/opt/$PG_FORMULA/bin" >> "$GITHUB_PATH"
+          export PATH="/opt/homebrew/opt/$PG_FORMULA/bin:$PATH"
+          /opt/homebrew/bin/timescaledb_move.sh || true
+          DATA="/opt/homebrew/var/$PG_FORMULA"
+          if [ ! -f "$DATA/PG_VERSION" ]; then initdb -D "$DATA"; fi
+          echo "shared_preload_libraries = 'timescaledb'" >> "$DATA/postgresql.conf"
+          brew services start "$PG_FORMULA"
+          for i in $(seq 1 30); do pg_isready && break; sleep 1; done
+          createdb testdb
+          psql -d testdb -c "CREATE ROLE testuser WITH SUPERUSER LOGIN PASSWORD 'testpass'"
+          psql -d testdb -c "CREATE EXTENSION IF NOT EXISTS timescaledb CASCADE"
+
+      - name: TimescaleDB (Windows)
+        if: runner.os == 'Windows'
+        shell: pwsh
+        env:
+          PGBIN: C:\Program Files\PostgreSQL\17\bin
+        run: |
+          $ErrorActionPreference = 'Stop'
+          Invoke-WebRequest -Uri https://github.com/timescale/timescaledb/releases/download/2.25.2/timescaledb-postgresql-17-windows-amd64.zip -OutFile ts.zip
+          tar -xf ts.zip
+          Push-Location (Get-ChildItem -Directory -Filter 'timescaledb*' | Select-Object -First 1).FullName
+          .\setup.exe -yes-tune -pgconfig "$env:PGBIN\pg_config.exe"
+          Pop-Location
+          $data = "$env:RUNNER_TEMP\pgdata"
+          & "$env:PGBIN\initdb.exe" -U postgres -A trust --encoding=UTF8 -D $data
+          & "$env:PGBIN\pg_ctl.exe" -D $data -o "-cshared_preload_libraries=timescaledb" -w start
+          & "$env:PGBIN\pg_isready.exe" --timeout=30
+          & "$env:PGBIN\psql.exe" -U postgres -c "CREATE ROLE testuser WITH SUPERUSER LOGIN PASSWORD 'testpass'"
+          & "$env:PGBIN\createdb.exe" -U postgres testdb
+          & "$env:PGBIN\psql.exe" -U postgres -d testdb -c "CREATE EXTENSION IF NOT EXISTS timescaledb CASCADE"
+
+      - uses: ./.github/actions/pub-get
+        with:
+          command: dart pub get
+          working-directory: src/packages/tfc_dart
+      - working-directory: src/packages/tfc_dart
+        env:
+          TIMESCALEDB_EXTERNAL: ${{ matrix.timescaledb_external }}
+        run: dart test
+      - if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: tfc-dart-results-${{ matrix.os }}
+          path: |
+            src/packages/tfc_dart/coverage/
+            src/packages/tfc_dart/test-results/
+          if-no-files-found: ignore
+          retention-days: 30
+
+  windows-runner-cpp-test:
+    name: windows-runner-cpp-test (${{ matrix.os }})
+    needs: context
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, windows-latest]
+    steps:
+      - uses: actions/checkout@v4
+      - uses: ./.github/actions/checkout-source
+        with:
+          ref: ${{ needs.context.outputs.ref }}
+          token: ${{ secrets.GH_PAT }}
+      - working-directory: src/centroid-hmi/windows/runner/test
+        run: |
+          cmake -S . -B build
+          cmake --build build --config Debug
+          ctest --test-dir build --build-config Debug --output-on-failure
+
+  elinux-video-plugin-cpp-test:
+    name: elinux-video-plugin-cpp-test (${{ matrix.os }})
+    needs: context
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-latest]
+    steps:
+      - uses: actions/checkout@v4
+      - uses: ./.github/actions/checkout-source
+        with:
+          ref: ${{ needs.context.outputs.ref }}
+          token: ${{ secrets.GH_PAT }}
+      - working-directory: src/packages/media_kit_video_elinux
+        run: |
+          cmake -S elinux/test -B build/test -DCMAKE_BUILD_TYPE=Debug
+          cmake --build build/test
+          ctest --test-dir build/test --verbose --output-on-failure 2>&1 | tee test-output.txt
+          ran=$(grep -c 'RUN  ' test-output.txt || true)
+          echo "$ran tests ran"
+          [ "$ran" -ge 16 ]
+
+  webview-cef-cpp-test:
+    name: webview-cef-cpp-test (${{ matrix.os }})
+    needs: context
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-latest, windows-latest]
+    steps:
+      - uses: actions/checkout@v4
+      - uses: ./.github/actions/checkout-source
+        with:
+          ref: ${{ needs.context.outputs.ref }}
+          token: ${{ secrets.GH_PAT }}
+      # The POSIX half does not compile on Windows, hence the lower floor.
+      - shell: bash
+        working-directory: src/packages/webview_cef
+        run: |
+          cmake -S common/test -B build/test -DCMAKE_BUILD_TYPE=Debug
+          cmake --build build/test
+          ctest --test-dir build/test --verbose --output-on-failure 2>&1 | tee test-output.txt
+          ran=$(grep -c 'RUN  ' test-output.txt || true)
+          floor=40; [ "${{ runner.os }}" = Windows ] && floor=28
+          echo "$ran tests ran (floor $floor)"
+          [ "$ran" -ge "$floor" ]
+
+  tools-python-test:
+    name: tools-python-test (${{ matrix.os }})
+    needs: context
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-latest]
+    steps:
+      - uses: actions/checkout@v4
+      - uses: ./.github/actions/checkout-source
+        with:
+          ref: ${{ needs.context.outputs.ref }}
+          token: ${{ secrets.GH_PAT }}
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.13'
+      - shell: bash
+        working-directory: src
+        run: |
+          set -o pipefail
+          python3 -m unittest discover -s tools -p 'test_*.py' -v 2>&1 | tee test-output.txt
+          ran=$(grep -c ' \.\.\. ok$' test-output.txt || true)
+          echo "$ran tests passed"
+          [ "$ran" -ge 105 ]
+
+  # The builds a PR must not break. Images are pushed as :pr-N when there is
+  # a PR number, and only built otherwise.
+  linux-build:
+    needs: context
+    uses: ./.github/workflows/linux.yml
+    secrets: inherit
+    with:
+      ref: ${{ needs.context.outputs.ref }}
+      group: ${{ needs.context.outputs.group }}
+  macos-build:
+    needs: context
+    uses: ./.github/workflows/macos.yml
+    secrets: inherit
+    with:
+      ref: ${{ needs.context.outputs.ref }}
+      group: ${{ needs.context.outputs.group }}
+  windows-build:
+    needs: context
+    uses: ./.github/workflows/windows.yml
+    secrets: inherit
+    with:
+      ref: ${{ needs.context.outputs.ref }}
+      group: ${{ needs.context.outputs.group }}
+      stamp_unstable_version: true
+  manager-build:
+    needs: context
+    uses: ./.github/workflows/manager.yml
+    secrets: inherit
+    with:
+      ref: ${{ needs.context.outputs.ref }}
+      group: ${{ needs.context.outputs.group }}
+  elinux-images:
+    needs: context
+    uses: ./.github/workflows/elinux.yml
+    secrets: inherit
+    with:
+      ref: ${{ needs.context.outputs.ref }}
+      publish: pr
+      pr_number: ${{ needs.context.outputs.pr }}
+      group: ${{ needs.context.outputs.group }}
+  station-checks:
+    needs: context
+    uses: ./.github/workflows/station-image.yml
+    secrets: inherit
+    with:
+      ref: ${{ needs.context.outputs.ref }}
+      validate_only: true
+      group: ${{ needs.context.outputs.group }}
+
+  # One verdict back to the PR in tfc-hmi.
+  report:
+    if: always() && github.event_name == 'repository_dispatch'
+    needs:
+      - context
+      - flutter-test
+      - centroid-hmi-test
+      - dart-packages
+      - jbtm-test
+      - plant-sim-test
+      - centroidx-upgrader-test
+      - tfc-dart-test
+      - windows-runner-cpp-test
+      - elinux-video-plugin-cpp-test
+      - webview-cef-cpp-test
+      - tools-python-test
+      - linux-build
+      - macos-build
+      - windows-build
+      - manager-build
+      - elinux-images
+      - station-checks
+    runs-on: ubuntu-latest
+    steps:
+      - env:
+          GH_TOKEN: ${{ secrets.GH_PAT }}
+          RESULTS: ${{ toJSON(needs) }}
+        run: |
+          failed=$(echo "$RESULTS" | jq -r 'to_entries[] | select(.value.result != "success" and .key != "context") | .key' | tr '\n' ' ')
+          if [ -z "$failed" ]; then state=success; desc='all green'; else state=failure; desc="failed: $failed"; fi
+          echo "$state: $desc"
+          gh api repos/centroid-is/tfc-hmi/statuses/${{ needs.context.outputs.ref }} \
+            -f state="$state" -f context='tfc-hmi-workflows / tests' \
+            -f description="${desc:0:130}" \
+            -f target_url="$GITHUB_SERVER_URL/$GITHUB_REPOSITORY/actions/runs/$GITHUB_RUN_ID"
+          [ "$state" = success ]

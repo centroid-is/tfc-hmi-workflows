@@ -1,0 +1,89 @@
+name: Check out tfc-hmi
+description: >
+  Checks the private source repository, centroid-is/tfc-hmi, out into `src/`
+  with the GH_PAT secret, and lets pub reach the private git dependencies
+  (open62541_dart, postgresql-dart, board_datetime_picker, cristalyse) through
+  the same token. Every job in this repository starts with this action: the
+  workflows live here, the code lives there.
+
+  The checkout is retried once. `actions/checkout` fails outright often enough
+  to matter (nine times in the 2.5 weeks to 2026-09-10 on the old repository),
+  and nothing about the change being built is involved.
+
+inputs:
+  ref:
+    description: Commit SHA, branch or tag of tfc-hmi to check out.
+    required: true
+  token:
+    description: A token that can read tfc-hmi and the private dependencies (GH_PAT).
+    required: true
+  repository:
+    description: The source repository.
+    required: false
+    default: centroid-is/tfc-hmi
+  path:
+    description: Where to put it, relative to the workspace.
+    required: false
+    default: src
+  fetch-depth:
+    description: Passed to actions/checkout. 0 for the full history (release notes, tags).
+    required: false
+    default: '1'
+
+outputs:
+  sha:
+    description: The full commit SHA that was checked out.
+    value: ${{ steps.sha.outputs.sha }}
+  short_sha:
+    description: The first seven characters of it.
+    value: ${{ steps.sha.outputs.short_sha }}
+
+runs:
+  using: composite
+  steps:
+    - name: Checkout tfc-hmi
+      id: first-attempt
+      uses: actions/checkout@v4
+      continue-on-error: true
+      with:
+        repository: ${{ inputs.repository }}
+        ref: ${{ inputs.ref }}
+        token: ${{ inputs.token }}
+        path: ${{ inputs.path }}
+        fetch-depth: ${{ inputs.fetch-depth }}
+
+    - name: Checkout tfc-hmi (retry)
+      if: steps.first-attempt.outcome == 'failure'
+      uses: actions/checkout@v4
+      with:
+        repository: ${{ inputs.repository }}
+        ref: ${{ inputs.ref }}
+        token: ${{ inputs.token }}
+        path: ${{ inputs.path }}
+        fetch-depth: ${{ inputs.fetch-depth }}
+
+    # pubspec.yaml pins git dependencies by https URL under centroid-is/.
+    # Those repositories are private, and pub clones them with plain git, so
+    # git itself has to carry the token. Global config: pub runs git from the
+    # pub cache, not from inside src/.
+    - name: Let git reach private centroid-is repositories
+      shell: bash
+      env:
+        TOKEN: ${{ inputs.token }}
+      run: |
+        git config --global url."https://x-access-token:${TOKEN}@github.com/centroid-is/".insteadOf "https://github.com/centroid-is/"
+        git config --global --add url."https://x-access-token:${TOKEN}@github.com/centroid-is/".insteadOf "git@github.com:centroid-is/"
+
+    - name: Resolve the source commit
+      id: sha
+      shell: bash
+      working-directory: ${{ inputs.path }}
+      run: |
+        sha="$(git rev-parse HEAD)"
+        if [ -z "$sha" ]; then
+          echo "::error::could not resolve the checked-out commit of ${{ inputs.repository }}"
+          exit 1
+        fi
+        echo "tfc-hmi at $sha (${{ inputs.ref }})"
+        echo "sha=$sha" >> "$GITHUB_OUTPUT"
+        echo "short_sha=${sha:0:7}" >> "$GITHUB_OUTPUT"

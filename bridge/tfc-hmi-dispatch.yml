@@ -1,0 +1,73 @@
+# Copy this file into tfc-hmi as .github/workflows/dispatch.yml.
+#
+# tfc-hmi is private; its builds, tests and releases run in the public
+# repository centroid-is/tfc-hmi-workflows. This is the one workflow that has
+# to stay in tfc-hmi: it tells the other repository that something happened.
+# It runs for a few seconds on ubuntu-latest, which is all the private-repo
+# Actions minutes the move leaves in use.
+#
+# Needs one secret in tfc-hmi, WORKFLOWS_DISPATCH_TOKEN: a token with
+# Contents read/write on centroid-is/tfc-hmi-workflows (repository_dispatch
+# needs that). The GH_PAT already used over there will do if it has it.
+#
+# What goes where:
+#   push to main        -> "push-main"    -> Tests, Main Prerelease
+#   push of a version   -> "tag"          -> Tag Release
+#     tag (not main-latest, not station-v*)
+#   pull request opened -> "pull-request" -> Tests, verdict back as the
+#     or pushed to                           commit status "tfc-hmi-workflows / tests"
+
+name: Dispatch to tfc-hmi-workflows
+
+on:
+  push:
+    branches: [main]
+    tags:
+      - '*'
+      - '!main-latest'
+      - '!station-v*'
+  pull_request:
+    types: [opened, synchronize, reopened]
+
+permissions:
+  contents: read
+
+jobs:
+  dispatch:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Work out the event
+        id: ev
+        run: |
+          case "$GITHUB_EVENT_NAME/$GITHUB_REF" in
+            push/refs/heads/main)
+              type=push-main
+              payload=$(jq -nc --arg sha "$GITHUB_SHA" '{sha: $sha}')
+              ;;
+            push/refs/tags/*)
+              type=tag
+              payload=$(jq -nc --arg sha "$GITHUB_SHA" --arg tag "${GITHUB_REF#refs/tags/}" '{sha: $sha, tag: $tag}')
+              ;;
+            pull_request/*)
+              type=pull-request
+              payload=$(jq -nc --arg sha "${{ github.event.pull_request.head.sha }}" \
+                --arg pr "${{ github.event.pull_request.number }}" \
+                --arg branch "${{ github.event.pull_request.head.ref }}" \
+                '{sha: $sha, pr: $pr, branch: $branch}')
+              ;;
+            *)
+              echo "nothing to dispatch for $GITHUB_EVENT_NAME on $GITHUB_REF"
+              exit 0
+              ;;
+          esac
+          echo "type=$type" >> "$GITHUB_OUTPUT"
+          echo "payload=$payload" >> "$GITHUB_OUTPUT"
+          echo "$type $payload"
+
+      - name: Send it
+        if: steps.ev.outputs.type != ''
+        env:
+          GH_TOKEN: ${{ secrets.WORKFLOWS_DISPATCH_TOKEN }}
+        run: |
+          gh api repos/centroid-is/tfc-hmi-workflows/dispatches \
+            --input <(jq -nc --arg t '${{ steps.ev.outputs.type }}' --argjson p '${{ steps.ev.outputs.payload }}' '{event_type: $t, client_payload: $p}')

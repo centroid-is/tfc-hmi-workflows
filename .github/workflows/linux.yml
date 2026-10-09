@@ -1,0 +1,85 @@
+name: Linux Build
+
+# The Linux desktop bundle, as a relocatable tarball. Called by test.yml for
+# every pull request (a PR must prove it does not break the build that
+# main-prerelease.yml publishes) and by main-prerelease.yml. Stable releases
+# do not carry it; tag-release.yml does not call this.
+
+on:
+  workflow_call:
+    inputs:
+      ref:
+        description: tfc-hmi commit, branch or tag to build
+        type: string
+        required: true
+      group:
+        description: Concurrency key; runs sharing it supersede each other (PRs). Empty = never cancelled.
+        type: string
+        default: ''
+  workflow_dispatch:
+    inputs:
+      ref:
+        description: tfc-hmi commit, branch or tag to build
+        type: string
+        default: main
+
+permissions:
+  contents: read
+
+# Prefixed per file: a called workflow has no run of its own, so without the
+# prefix the Linux, macOS and Windows builds of one caller would share a group
+# and queue behind each other.
+concurrency:
+  group: linux-${{ inputs.group || github.run_id }}
+  cancel-in-progress: true
+
+jobs:
+  build:
+    name: Linux Build
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Check out tfc-hmi
+        id: src
+        uses: ./.github/actions/checkout-source
+        with:
+          ref: ${{ inputs.ref }}
+          token: ${{ secrets.GH_PAT }}
+
+      # GTK shell; libsecret and jsoncpp for flutter_secure_storage_linux;
+      # liblzma for the Flutter toolchain; libmpv for the media_kit RTSP
+      # camera. The bundle does not ship libmpv, the target needs the distro's.
+      - name: Install build dependencies
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y clang cmake ninja-build pkg-config libgtk-3-dev liblzma-dev libsecret-1-dev libjsoncpp-dev libmpv-dev
+
+      - uses: ./.github/actions/setup-flutter
+
+      - uses: ./.github/actions/pub-get
+        with:
+          working-directory: src/centroid-hmi
+
+      # Shipped binaries exclude the AI chat and knowledge features for now
+      # (lib/core/feature_flags.dart). GIT_SHA lets the latest channel tell
+      # whether the running main build is stale.
+      - name: Build
+        working-directory: src/centroid-hmi
+        run: |
+          flutter build linux --release \
+            --dart-define=GIT_SHA=${{ steps.src.outputs.sha }} \
+            --dart-define=CENTROIDX_CHAT=false \
+            --dart-define=CENTROIDX_KNOWLEDGE=false
+
+      # The bundle is relocatable through its $ORIGIN/lib rpath.
+      - name: Package
+        working-directory: src/centroid-hmi/build/linux/x64/release
+        run: |
+          mv bundle centroidx-linux-x64
+          tar -czf "$GITHUB_WORKSPACE/centroidx_linux_x64.tar.gz" centroidx-linux-x64
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: centroidx_linux_x64.tar.gz
+          path: centroidx_linux_x64.tar.gz

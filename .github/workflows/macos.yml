@@ -1,0 +1,191 @@
+name: macOS Build
+
+# The macOS app as a DMG, signed and notarized when the Apple secrets are set,
+# unsigned otherwise. Called by test.yml (every PR), main-prerelease.yml and
+# tag-release.yml.
+
+on:
+  workflow_call:
+    inputs:
+      ref:
+        description: tfc-hmi commit, branch or tag to build
+        type: string
+        required: true
+      group:
+        description: Concurrency key; runs sharing it supersede each other (PRs). Empty = never cancelled.
+        type: string
+        default: ''
+  workflow_dispatch:
+    inputs:
+      ref:
+        description: tfc-hmi commit, branch or tag to build
+        type: string
+        default: main
+
+permissions:
+  contents: read
+
+# Superseding matters most here: GitHub Free allows five concurrent macOS
+# jobs, and stacked PR pushes were the main source of runner starvation.
+concurrency:
+  group: macos-${{ inputs.group || github.run_id }}
+  cancel-in-progress: true
+
+jobs:
+  build:
+    name: macOS Build
+    runs-on: macos-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Check out tfc-hmi
+        id: src
+        uses: ./.github/actions/checkout-source
+        with:
+          ref: ${{ inputs.ref }}
+          token: ${{ secrets.GH_PAT }}
+
+      - name: Import signing certificate
+        env:
+          APPLE_CERTIFICATE_P12_BASE64: ${{ secrets.APPLE_CERTIFICATE_P12_BASE64 }}
+          APPLE_CERTIFICATE_PASSWORD: ${{ secrets.APPLE_CERTIFICATE_PASSWORD }}
+        run: |
+          if [ -z "$APPLE_CERTIFICATE_P12_BASE64" ]; then
+            echo "No signing certificate configured; building unsigned."
+            exit 0
+          fi
+          KEYCHAIN_PATH="$RUNNER_TEMP/signing.keychain-db"
+          KEYCHAIN_PASSWORD="$(openssl rand -hex 16)"
+          CERT_PATH="$RUNNER_TEMP/certificate.p12"
+          echo "$APPLE_CERTIFICATE_P12_BASE64" | base64 --decode > "$CERT_PATH"
+          security create-keychain -p "$KEYCHAIN_PASSWORD" "$KEYCHAIN_PATH"
+          security set-keychain-settings -lut 21600 "$KEYCHAIN_PATH"
+          security unlock-keychain -p "$KEYCHAIN_PASSWORD" "$KEYCHAIN_PATH"
+          security import "$CERT_PATH" -P "$APPLE_CERTIFICATE_PASSWORD" -A -t cert -f pkcs12 -k "$KEYCHAIN_PATH"
+          security list-keychains -d user -s "$KEYCHAIN_PATH" login.keychain
+          security set-key-partition-list -S apple-tool:,apple: -s -k "$KEYCHAIN_PASSWORD" "$KEYCHAIN_PATH"
+          rm -f "$CERT_PATH"
+          IDENTITY="$(security find-identity -v -p codesigning "$KEYCHAIN_PATH" | grep 'Developer ID Application' | head -1 | awk -F'"' '{print $2}')"
+          if [ -z "$IDENTITY" ]; then
+            echo "::error::the certificate imported, but no 'Developer ID Application' identity was found in it"
+            exit 1
+          fi
+          echo "CODESIGN_IDENTITY=$IDENTITY" >> "$GITHUB_ENV"
+          echo "KEYCHAIN_PATH=$KEYCHAIN_PATH" >> "$GITHUB_ENV"
+
+      # Xcode must not try to sign during the Flutter build: the project is
+      # set to automatic signing with a development team no runner has. The
+      # app is signed afterwards, by hand, with the Developer ID identity.
+      - name: Disable Xcode signing
+        working-directory: src/centroid-hmi/macos
+        run: |
+          sed -i '' 's/CODE_SIGN_STYLE = Automatic/CODE_SIGN_STYLE = Manual/g' Runner.xcodeproj/project.pbxproj
+          sed -i '' 's/"CODE_SIGN_IDENTITY\[sdk=macosx\*\]" = "Apple Development"/CODE_SIGN_IDENTITY = ""/g' Runner.xcodeproj/project.pbxproj
+          sed -i '' 's/CODE_SIGN_IDENTITY = "-"/CODE_SIGN_IDENTITY = ""/g' Runner.xcodeproj/project.pbxproj
+          sed -i '' '/DEVELOPMENT_TEAM/d' Runner.xcodeproj/project.pbxproj
+          sed -i '' '/PROVISIONING_PROFILE_SPECIFIER/d' Runner.xcodeproj/project.pbxproj
+          sed -i '' '/CODE_SIGN_ENTITLEMENTS/d' Runner.xcodeproj/project.pbxproj
+
+      - uses: ./.github/actions/setup-flutter
+
+      - uses: ./.github/actions/pub-get
+        with:
+          working-directory: src/centroid-hmi
+
+      - name: Inject no-signing xcconfig
+        working-directory: src/centroid-hmi/macos
+        run: |
+          cat > NoSign.xcconfig <<'EOF'
+          CODE_SIGN_IDENTITY =
+          CODE_SIGNING_REQUIRED = NO
+          CODE_SIGNING_ALLOWED = NO
+          EOF
+          echo '#include "NoSign.xcconfig"' >> Flutter/Release.xcconfig
+
+      - name: Build
+        working-directory: src/centroid-hmi
+        run: |
+          flutter build macos --release \
+            --dart-define=GIT_SHA=${{ steps.src.outputs.sha }} \
+            --dart-define=CENTROIDX_CHAT=false \
+            --dart-define=CENTROIDX_KNOWLEDGE=false
+
+      - name: Sign the app bundle
+        if: env.CODESIGN_IDENTITY != ''
+        working-directory: src/centroid-hmi
+        env:
+          APPLE_TEAM_ID: ${{ secrets.APPLE_TEAM_ID }}
+        run: |
+          APP_PATH="$(find build/macos/Build/Products/Release -maxdepth 1 -name '*.app' | head -1)"
+          if [ -z "$APP_PATH" ]; then
+            echo "::error::no .app in build/macos/Build/Products/Release"
+            exit 1
+          fi
+          # Inside out: every dylib, framework binary and executable first,
+          # then the frameworks, then the app with its entitlements.
+          find "$APP_PATH" \( -name '*.dylib' -o -perm +111 -type f \) -not -path '*/Headers/*' | while read -r f; do
+            codesign --force --options runtime --sign "$CODESIGN_IDENTITY" --timestamp "$f" || true
+          done
+          find "$APP_PATH" -name '*.framework' -type d | while read -r fw; do
+            codesign --force --options runtime --sign "$CODESIGN_IDENTITY" --timestamp "$fw" || true
+          done
+          TEAM_ID="${APPLE_TEAM_ID:-Q4FZLRTZ4M}"
+          sed "s/\$(AppIdentifierPrefix)/$TEAM_ID./g" macos/Runner/Release.entitlements > /tmp/release.entitlements
+          codesign --force --options runtime --sign "$CODESIGN_IDENTITY" --timestamp \
+            --entitlements /tmp/release.entitlements "$APP_PATH"
+          codesign --verify --deep --strict "$APP_PATH"
+          echo "APP_PATH=$PWD/$APP_PATH" >> "$GITHUB_ENV"
+
+      - name: Locate the unsigned app bundle
+        if: env.CODESIGN_IDENTITY == ''
+        working-directory: src/centroid-hmi
+        run: |
+          APP_PATH="$(find build/macos/Build/Products/Release -maxdepth 1 -name '*.app' | head -1)"
+          if [ -z "$APP_PATH" ]; then
+            echo "::error::no .app in build/macos/Build/Products/Release"
+            exit 1
+          fi
+          echo "APP_PATH=$PWD/$APP_PATH" >> "$GITHUB_ENV"
+
+      - name: Create DMG
+        run: |
+          DMG_NAME="centroidx_darwin_arm64.dmg"
+          DMG_DIR="$RUNNER_TEMP/dmg-contents"
+          rm -rf "$DMG_DIR"
+          mkdir -p "$DMG_DIR"
+          cp -R "$APP_PATH" "$DMG_DIR/CentroidX.app"
+          ln -s /Applications "$DMG_DIR/Applications"
+          bash .github/scripts/create-dmg.sh "CentroidX" "$DMG_DIR" "$DMG_NAME"
+          echo "DMG_NAME=$DMG_NAME" >> "$GITHUB_ENV"
+
+      - name: Sign the DMG
+        if: env.CODESIGN_IDENTITY != ''
+        run: |
+          codesign --force --sign "$CODESIGN_IDENTITY" --timestamp "$DMG_NAME"
+          codesign --verify --strict "$DMG_NAME"
+
+      # Orange, not red, when Apple's service fails: the DMG is still a valid
+      # signed build. Do not ship a release built from an orange run without
+      # checking it.
+      - name: Notarize
+        if: env.CODESIGN_IDENTITY != ''
+        continue-on-error: true
+        env:
+          APPLE_ID: ${{ secrets.APPLE_ID }}
+          APPLE_ID_PASSWORD: ${{ secrets.APPLE_ID_PASSWORD }}
+          APPLE_TEAM_ID: ${{ secrets.APPLE_TEAM_ID }}
+        run: |
+          if ! xcrun notarytool submit "$DMG_NAME" --apple-id "$APPLE_ID" --password "$APPLE_ID_PASSWORD" --team-id "$APPLE_TEAM_ID" --wait; then
+            echo "::warning title=Notarization failed::notarytool did not accept $DMG_NAME; the DMG is signed but not notarized."
+            exit 1
+          fi
+          xcrun stapler staple "$DMG_NAME"
+
+      - name: Remove the signing keychain
+        if: always() && env.KEYCHAIN_PATH != ''
+        run: security delete-keychain "$KEYCHAIN_PATH" || true
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: centroidx_darwin_arm64.dmg
+          path: ${{ env.DMG_NAME }}

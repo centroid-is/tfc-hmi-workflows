@@ -1,0 +1,28 @@
+name: Log in to ghcr.io
+description: >
+  Logs Docker in to the GitHub container registry with GH_PAT.
+
+  Not GITHUB_TOKEN: the images this repository pushes (centroid-hmi,
+  centroid-backend, hmi-profiler) and pulls (tfc-toolchain, weston) are owned
+  by the centroid-is organisation and linked to other repositories, and a
+  workflow's own token only reaches packages linked to the repository it runs
+  in. A classic PAT with `write:packages` reaches them all. Fine-grained PATs
+  cannot be granted package scopes at all, so GH_PAT has to be a classic one.
+
+inputs:
+  token:
+    description: GH_PAT.
+    required: true
+  username:
+    description: Any GitHub username; ghcr.io authenticates on the token.
+    required: false
+    default: ${{ github.actor }}
+
+runs:
+  using: composite
+  steps:
+    - uses: docker/login-action@v3
+      with:
+        registry: ghcr.io
+        username: ${{ inputs.username }}
+        password: ${{ inputs.token }}

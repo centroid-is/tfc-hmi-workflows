@@ -1,0 +1,382 @@
+name: Station image
+
+# The Debian station OS from tfc-hmi/os: validation of the recipes and
+# scripts, the setup app, the disk image and the USB installer. Called by
+# test.yml with validate_only (every PR), main-prerelease.yml (channel
+# prerelease) and tag-release.yml (channel stable). A hand run with
+# release_tag publishes a station-v* release of the image itself.
+
+on:
+  workflow_call:
+    inputs:
+      ref:
+        description: tfc-hmi commit, branch or tag to build
+        type: string
+        required: true
+      validate_only:
+        description: Run the checks and the setup-app tests only; build no image.
+        type: boolean
+        default: false
+      gpu:
+        type: string
+        default: intel
+      channel:
+        description: >
+          Which image tags the baked compose points at: prerelease
+          (centroid-hmi:latest-release) or stable (:stable). Never the
+          compose file's own :latest, which is a debug Flutter build.
+        type: string
+        default: prerelease
+      preload:
+        description: Bake the container images into the stick (~1.9 GB) so it installs with no uplink.
+        type: boolean
+        default: true
+      group:
+        type: string
+        default: ''
+  workflow_dispatch:
+    inputs:
+      ref:
+        type: string
+        default: main
+      preload:
+        type: boolean
+        default: false
+      gpu:
+        type: choice
+        options: [intel, amd]
+        default: intel
+      channel:
+        type: choice
+        options: [prerelease, stable]
+        default: prerelease
+      release_tag:
+        description: Publish the image as this station release, e.g. station-v2026.09.12. Empty = artifacts only.
+        type: string
+        default: ''
+
+permissions:
+  contents: read
+
+# Never cancelled by a later run: a hand-run release must not be killed by a
+# merge.
+concurrency:
+  group: station-image-${{ inputs.group || github.run_id }}
+  cancel-in-progress: false
+
+jobs:
+  validate:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: ./.github/actions/checkout-source
+        with:
+          ref: ${{ inputs.ref }}
+          token: ${{ secrets.GH_PAT }}
+
+      - name: shellcheck
+        working-directory: src/os
+        run: |
+          docker run --rm -v "$PWD:/w" -w /w koalaman/shellcheck@sha256:bb596a0d169b85ddd81d8b6d3a2ff6d5baf5fca10b97f575ebc647c3dff62b3d \
+            scripts/*.sh test/*.sh \
+            overlays/base/usr/local/bin/centroidx-firstboot \
+            overlays/installer/usr/local/bin/centroidx-install \
+            overlays/installer/usr/local/bin/centroidx-install-failsafe \
+            overlays/installer/usr/local/bin/centroidx-gui-launch \
+            overlays/installer/usr/local/bin/centroidx-remote-access
+
+      - name: Installer and firmware tests
+        working-directory: src/os
+        run: |
+          sudo apt-get install -y wireguard-tools
+          bash test/installer-test.sh
+          bash test/gpu-firmware-test.sh
+
+      - name: Archive keys unchanged
+        working-directory: src/os
+        run: make verify-keys
+
+      - name: debos dry run of every recipe
+        working-directory: src/os
+        run: make dry-run
+
+      - name: docker compose config
+        working-directory: src
+        run: |
+          sed -e 's/^\([A-Z_]*\)=$/\1=ci-placeholder/' .env.example > .env
+          docker compose config --quiet
+          rm -f .env
+
+      # An offline station cannot install packages at container start; the
+      # `apk add` in pg-certs once blacked out a fresh panel.
+      - name: No package installs at container start
+        working-directory: src
+        run: |
+          python3 - <<'EOF'
+          import re, sys
+          bad = re.compile(r'apk add|apt-get install|apt install|dnf install|yum install|pip3? install|npm install|gem install')
+          failed = False
+          for f in ('docker-compose.yml', 'docker/backend/docker-compose.yml'):
+              for n, line in enumerate(open(f), 1):
+                  if line.lstrip().startswith('#'):
+                      continue
+                  if bad.search(line):
+                      print(f'::error file={f},line={n}::package install at container start: {line.strip()}')
+                      failed = True
+          sys.exit(1 if failed else 0)
+          EOF
+
+      - name: Every compose variable is in .env.example and written at first boot
+        working-directory: src
+        run: |
+          python3 - <<'EOF'
+          import re, sys
+          example = set(re.findall(r'^([A-Z_][A-Z0-9_]*)=', open('.env.example').read(), re.M))
+          firstboot = open('os/overlays/base/usr/local/bin/centroidx-firstboot').read()
+          failed = False
+          for f in ('docker-compose.yml', 'docker/backend/docker-compose.yml'):
+              text = open(f).read().replace('$$', '')
+              for m in re.finditer(r'\$\{([A-Z_][A-Z0-9_]*)(:?\?[^}]*)?\}|\$([A-Z_][A-Z0-9_]*)', text):
+                  var = m.group(1) or m.group(3)
+                  required = m.group(2) is not None
+                  if var not in example:
+                      print(f'::error file={f}::{var} is not in .env.example'); failed = True
+                  if required and not re.search(r'(echo|printf)[^\n]*\b' + var + '=', firstboot):
+                      print(f'::error file={f}::{var} is required but centroidx-firstboot never writes it'); failed = True
+          sys.exit(1 if failed else 0)
+          EOF
+
+  # The toolchain image has only the flutter-elinux wrapper on PATH, which is
+  # why os/app pins its Dart SDK the way it does.
+  app-checks:
+    runs-on: ubuntu-latest
+    container:
+      image: ghcr.io/centroid-is/tfc-toolchain:latest
+      credentials:
+        username: ${{ github.actor }}
+        password: ${{ secrets.GH_PAT }}
+    steps:
+      - run: git config --system --add safe.directory '*'
+      - uses: actions/checkout@v4
+      - uses: ./.github/actions/checkout-source
+        with:
+          ref: ${{ inputs.ref }}
+          token: ${{ secrets.GH_PAT }}
+      - name: analyze and test the setup app
+        working-directory: src/os/app
+        run: |
+          flutter-elinux pub get
+          flutter-elinux analyze
+          flutter-elinux test
+
+  setup-app:
+    needs: validate
+    if: ${{ !inputs.validate_only }}
+    runs-on: ubuntu-latest
+    container:
+      image: ghcr.io/centroid-is/tfc-toolchain:latest
+      credentials:
+        username: ${{ github.actor }}
+        password: ${{ secrets.GH_PAT }}
+    steps:
+      - run: git config --system --add safe.directory '*'
+      - uses: actions/checkout@v4
+      - uses: ./.github/actions/checkout-source
+        with:
+          ref: ${{ inputs.ref }}
+          token: ${{ secrets.GH_PAT }}
+      - name: Build the setup app
+        working-directory: src/os/app
+        run: |
+          flutter-elinux create --platforms=elinux .
+          flutter-elinux pub get
+          flutter-elinux build elinux --release
+          ls -la build/elinux/x64/release/bundle
+      - uses: actions/upload-artifact@v4
+        with:
+          name: setup-app-bundle
+          path: src/os/app/build/elinux/x64/release/bundle
+          retention-days: 14
+
+  build:
+    needs: [validate, setup-app]
+    if: ${{ !inputs.validate_only }}
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    defaults:
+      run:
+        working-directory: src/os
+    steps:
+      - uses: actions/checkout@v4
+      - uses: ./.github/actions/checkout-source
+        with:
+          ref: ${{ inputs.ref }}
+          token: ${{ secrets.GH_PAT }}
+
+      # debos needs a fakemachine for image-partition.
+      - name: Make /dev/kvm usable
+        run: |
+          if [ ! -e /dev/kvm ]; then
+            echo "::error::/dev/kvm is missing on this runner"
+            exit 1
+          fi
+          echo 'KERNEL=="kvm", GROUP="kvm", MODE="0666", OPTIONS+="static_node=kvm"' | sudo tee /etc/udev/rules.d/99-kvm4all.rules
+          sudo udevadm control --reload-rules
+          sudo udevadm trigger --name-match=kvm
+
+      - name: Install image tools
+        run: sudo apt-get install -y bmap-tools zstd
+
+      - uses: actions/download-artifact@v4
+        with:
+          name: setup-app-bundle
+          path: src/os/out/app-bundle
+
+      # Artifacts drop the exec bit; the silent fallback to the text
+      # installer hid this once.
+      - name: Restore the setup app's exec bit
+        run: |
+          found=
+          for f in out/app-bundle/flutter_elinux_wayland out/app-bundle/centroidx_setup; do
+            if [ -e "$f" ]; then chmod 755 "$f"; found=1; fi
+          done
+          if [ -z "$found" ]; then
+            echo "::error::no setup app binary in out/app-bundle"
+            exit 1
+          fi
+
+      - uses: ./.github/actions/ghcr-login
+        with:
+          token: ${{ secrets.GH_PAT }}
+
+      # The keyboard comes from the weston image, and the bundle's engine .so
+      # must be the one the published centroid-hmi image was built with.
+      - name: Take centroidx-keyboard and the engine from the published images
+        run: |
+          mkdir -p out/bin
+          docker pull ghcr.io/centroid-is/weston:latest
+          docker create --name kb ghcr.io/centroid-is/weston:latest
+          docker cp kb:/usr/local/bin/centroidx-keyboard out/bin/centroidx-keyboard
+          docker rm kb
+          chmod 755 out/bin/centroidx-keyboard
+          docker pull ghcr.io/centroid-is/centroid-hmi:latest
+          docker create --name hmi ghcr.io/centroid-is/centroid-hmi:latest
+          docker cp hmi:/flutter-app/lib/libflutter_elinux_wayland.so out/app-bundle/lib/libflutter_elinux_wayland.so
+          docker rm hmi
+
+      - name: Free disk space
+        run: sudo rm -rf /usr/local/lib/android /usr/share/dotnet /opt/ghc /usr/local/share/boost "$AGENT_TOOLSDIRECTORY"
+
+      - name: Build the image
+        run: make image GPU=${{ inputs.gpu || 'intel' }} PRELOAD=${{ inputs.preload && 'true' || 'false' }} CHANNEL=${{ inputs.channel || 'prerelease' }} DOCKER_TTY=
+
+      - name: The baked compose points at the right image tags
+        run: |
+          set +e
+          set -uo pipefail
+          C=overlays/generated/home/centroid/docker-compose.yml
+          fail=0
+          ck() { if ! eval "$1"; then echo "::error::$2"; fail=1; fi; }
+          ck "test -f $C" "no generated compose at $C"
+          ck "! grep -Eq 'centroid-hmi:latest[[:space:]]*$' $C" "compose points at centroid-hmi:latest, the debug build"
+          if [ "${{ inputs.channel || 'prerelease' }}" = stable ]; then
+            for i in centroid-hmi:stable centroid-backend:stable hmi-profiler:stable; do ck "grep -q '$i' $C" "compose lacks $i"; done
+          else
+            ck "grep -q 'centroid-hmi:latest-release' $C" "compose lacks centroid-hmi:latest-release"
+          fi
+          for i in weston:latest novnc:latest docker-update:latest; do ck "grep -q '$i' $C" "compose lacks $i"; done
+          exit $fail
+
+      # PRELOAD again: the Makefile derives USBSIZE from it (8GB or 4GB).
+      - name: Build the USB installer
+        run: make usb DOCKER_TTY= PRELOAD=${{ inputs.preload && 'true' || 'false' }}
+
+      - name: Assert the built USB is the graphical installer
+        run: |
+          set +e
+          set -uo pipefail
+          img="$RUNNER_TEMP/usb.img"; mnt="$RUNNER_TEMP/usb-mnt"
+          gunzip -c out/usb-installer.img.gz > "$img"
+          loop=$(sudo losetup -f --show -P "$img")
+          mkdir -p "$mnt"
+          sudo mount -o ro "${loop}p2" "$mnt"
+          fail=0
+          t() { if ! sudo sh -c "$1"; then echo "::error::$2"; fail=1; fi; }
+          W=$mnt/etc/systemd/system/multi-user.target.wants
+          t "test -L $W/centroidx-gui.service" "centroidx-gui.service is not enabled"
+          t "test ! -L $W/centroidx-installer.service" "the text installer is enabled instead of the GUI"
+          t "test -x $mnt/opt/centroidx-setup/centroidx_setup || test -x $mnt/opt/centroidx-setup/flutter_elinux_wayland" "no setup app binary under /opt/centroidx-setup"
+          t "test -s $mnt/opt/centroidx-setup/lib/libflutter_elinux_wayland.so" "setup app has no engine .so"
+          for b in centroidx-keyboard centroidx-setup centroidx-gui-launch centroidx-remote-access; do
+            t "test -x $mnt/usr/local/bin/$b" "/usr/local/bin/$b missing or not executable"
+          done
+          t "grep -q 'path=/usr/local/bin/centroidx-keyboard' $mnt/etc/xdg/weston/weston.ini" "weston.ini does not start the keyboard"
+          t "grep -q 'backend=drm,vnc' $mnt/etc/xdg/weston/weston.ini" "weston.ini lacks the vnc backend"
+          t "find $mnt/usr -name 'vnc-backend.so' | grep -q ." "weston vnc-backend.so missing"
+          u=$mnt/etc/systemd/system/centroidx-gui.service
+          t "grep -q '^OnFailure=' $u" "gui unit has no OnFailure"
+          t "grep -q '^OnSuccess=centroidx-installer.service' $u" "gui unit does not hand over to the installer"
+          t "grep -q '^ExecStart=/usr/local/bin/centroidx-gui-launch' $u" "gui unit ExecStart wrong"
+          t "grep -q '^LimitNOFILE=16384' $u" "gui unit LimitNOFILE wrong"
+          t "test -L $W/centroidx-remote-access.service" "remote access not enabled"
+          t "test -f $mnt/etc/pam.d/weston-remote-access" "pam weston-remote-access missing"
+          t "test -L $W/centroidx-novnc.service" "novnc not enabled"
+          t "test -x $mnt/usr/bin/websockify" "websockify missing"
+          t "test -f $mnt/usr/share/novnc/vnc.html" "novnc missing"
+          t "test ! -e $mnt/usr/bin/node && test ! -e $mnt/usr/bin/nodejs" "node is on the image"
+          t "test -f $mnt/etc/systemd/network/10-dhcp.network" "no dhcp network unit"
+          t "test -L $W/systemd-networkd.service || test -L $mnt/etc/systemd/system/sockets.target.wants/systemd-networkd.socket" "systemd-networkd not enabled"
+          t "test -x $mnt/usr/sbin/ip || test -x $mnt/sbin/ip || test -x $mnt/usr/bin/ip" "ip missing"
+          if [ $fail -ne 0 ]; then sudo ls -la "$mnt/usr/local/bin" "$W" || true; fi
+          sudo umount "$mnt"; sudo losetup -d "$loop"
+          exit $fail
+
+      - name: Boot the installer and photograph it
+        run: |
+          sudo apt-get install -y qemu-system-x86 ovmf
+          img="$RUNNER_TEMP/usb.img"
+          [ -f "$img" ] || gunzip -c out/usb-installer.img.gz > "$img"
+          python3 scripts/boot-test.py --usb "$img" --out out/boot-test
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: station-boot-test
+          path: src/os/out/boot-test
+          retention-days: 14
+
+      - name: Checksums
+        run: |
+          cd out && sha256sum *.img.gz *.bmap | tee SHA256SUMS
+          cat ../overlays/generated/etc/centroid/image-info
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: station-image
+          path: |
+            src/os/out/centroidx-*.img.gz
+            src/os/out/centroidx-*.img.bmap
+            src/os/out/SHA256SUMS
+            src/os/overlays/generated/etc/centroid/image-info
+          retention-days: 14
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: station-usb-installer
+          path: |
+            src/os/out/usb-installer.img.gz
+            src/os/out/usb-installer.img.bmap
+          retention-days: 14
+
+      # Assets go to `create`, not a later upload, so a failed upload cannot
+      # leave a tagged empty release.
+      - name: Publish a station release
+        if: github.event_name == 'workflow_dispatch' && inputs.release_tag != ''
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          TAG: ${{ inputs.release_tag }}
+        run: |
+          gh release create "$TAG" --repo "$GITHUB_REPOSITORY" --target "$GITHUB_SHA" \
+            --title "Station image $TAG" \
+            --notes-file overlays/generated/etc/centroid/image-info \
+            out/*.img.gz out/*.bmap out/SHA256SUMS

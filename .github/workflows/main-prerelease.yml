@@ -1,0 +1,209 @@
+name: Main Prerelease
+
+# The rolling prerelease: every push to tfc-hmi main (relayed by the bridge
+# workflow as repository_dispatch "push-main") rebuilds everything and
+# republishes the `main-latest` release of THIS repository, which is what the
+# app's `latest` update channel and the manager follow.
+#
+# The tag is `main-latest`, not `main`: a tag named like a branch makes
+# `git <cmd> main` ambiguous, and tag-release.yml would treat it as a version.
+
+on:
+  repository_dispatch:
+    types: [push-main]
+  workflow_dispatch:
+    inputs:
+      ref:
+        description: tfc-hmi commit or branch to publish as main-latest
+        type: string
+        default: main
+
+permissions:
+  contents: write
+
+concurrency:
+  group: main-prerelease
+  cancel-in-progress: true
+
+jobs:
+  context:
+    runs-on: ubuntu-latest
+    outputs:
+      ref: ${{ steps.ctx.outputs.ref }}
+    steps:
+      - id: ctx
+        run: |
+          ref='${{ github.event.client_payload.sha || inputs.ref }}'
+          echo "ref=$ref" >> "$GITHUB_OUTPUT"
+          echo "publishing tfc-hmi $ref as main-latest"
+
+  windows-build:
+    needs: context
+    uses: ./.github/workflows/windows.yml
+    secrets: inherit
+    with:
+      ref: ${{ needs.context.outputs.ref }}
+      stamp_unstable_version: true
+  macos-build:
+    needs: context
+    uses: ./.github/workflows/macos.yml
+    secrets: inherit
+    with:
+      ref: ${{ needs.context.outputs.ref }}
+  linux-build:
+    needs: context
+    uses: ./.github/workflows/linux.yml
+    secrets: inherit
+    with:
+      ref: ${{ needs.context.outputs.ref }}
+  # The integration tests download from the release this run is about to
+  # replace; gating on them deadlocked releases once.
+  manager-build:
+    needs: context
+    uses: ./.github/workflows/manager.yml
+    secrets: inherit
+    with:
+      ref: ${{ needs.context.outputs.ref }}
+      run_integration_tests: false
+  elinux-images:
+    needs: context
+    uses: ./.github/workflows/elinux.yml
+    secrets: inherit
+    with:
+      ref: ${{ needs.context.outputs.ref }}
+      publish: main
+  # Waited for, so the stick on main-latest is built from this commit, but
+  # its result does not gate the app assets.
+  station-image:
+    needs: context
+    uses: ./.github/workflows/station-image.yml
+    secrets: inherit
+    with:
+      ref: ${{ needs.context.outputs.ref }}
+      channel: prerelease
+      preload: true
+
+  publish:
+    needs: [context, windows-build, macos-build, linux-build, manager-build, station-image]
+    if: >-
+      !cancelled() &&
+      needs.windows-build.result == 'success' &&
+      needs.macos-build.result == 'success' &&
+      needs.linux-build.result == 'success' &&
+      needs.manager-build.result == 'success'
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/download-artifact@v4
+        with:
+          name: centroid-hmi-windows-portable
+          path: centroidx-windows-x64/
+      - uses: actions/download-artifact@v4
+        with:
+          name: centroid-hmi.msix
+          path: msix/
+      - uses: actions/download-artifact@v4
+        with:
+          name: centroidx-sideload.cer
+          path: release/
+      - uses: actions/download-artifact@v4
+        with:
+          name: centroidx_darwin_arm64.dmg
+          path: release/
+      - uses: actions/download-artifact@v4
+        with:
+          name: centroidx_linux_x64.tar.gz
+          path: release/
+      - uses: actions/download-artifact@v4
+        with:
+          pattern: centroidx-manager_*
+          path: manager/
+          merge-multiple: true
+      - uses: actions/download-artifact@v4
+        continue-on-error: true
+        with:
+          name: station-usb-installer
+          path: release/
+
+      - name: Assemble the release assets
+        run: |
+          set -euo pipefail
+          for f in usb-installer.img.gz usb-installer.img.bmap; do
+            if [ ! -f "release/$f" ]; then
+              found=$(find release -name "$f" | head -1 || true)
+              if [ -n "$found" ]; then echo "::warning::$f was nested at $found"; mv "$found" "release/$f"; fi
+            fi
+          done
+          # GitHub refuses assets of 2 GiB and more. 800 MB parts: 1.7 GB
+          # parts died with "HTTP 500: Error saving asset".
+          if [ -f release/usb-installer.img.gz ] && [ "$(stat -c %s release/usb-installer.img.gz)" -ge 2147483648 ]; then
+            (cd release && split -b 800000000 -d -a 2 usb-installer.img.gz usb-installer.img.gz.part && rm -f usb-installer.img.gz)
+          fi
+          zip -qr release/centroidx_windows_x64.zip centroidx-windows-x64
+          # The canonical name the manager looks for; msix:create emits centroidx.msix.
+          mv msix/*.msix release/centroidx_windows_amd64.msix
+          mv manager/centroidx-manager_* release/
+          cd release
+          # Named, never globbed, so a missing asset fails here.
+          sums=( centroidx_windows_x64.zip centroidx_windows_amd64.msix centroidx-sideload.cer centroidx_darwin_arm64.dmg centroidx_linux_x64.tar.gz centroidx-manager_windows_amd64.exe centroidx-manager_darwin_arm64.dmg centroidx-manager_linux_amd64 )
+          station=()
+          if ls usb-installer.img.gz* >/dev/null 2>&1 && [ -f usb-installer.img.bmap ]; then
+            station=( $(ls usb-installer.img.gz*) usb-installer.img.bmap )
+          else
+            echo "::warning::no complete station installer in this run (both halves or neither)"
+            rm -f usb-installer.img.gz* usb-installer.img.bmap
+          fi
+          sha256sum "${sums[@]}" "${station[@]}" > SHA256SUMS.txt
+          ls -la
+
+      # Created empty first so README links resolve seconds after the delete,
+      # then assets uploaded smallest first with --clobber (an upload can fail
+      # after the asset was saved, which makes the retry a 422 duplicate).
+      - name: Republish main-latest
+        env:
+          GH_TOKEN: ${{ github.token }}
+          SRC_SHA: ${{ needs.context.outputs.ref }}
+        run: |
+          set -uo pipefail
+          cd release
+          station=( $(ls usb-installer.img.gz* usb-installer.img.bmap 2>/dev/null || true) )
+          if [ "${#station[@]}" -gt 0 ]; then
+            if ls usb-installer.img.gz.part* >/dev/null 2>&1; then
+              row='| Station USB installer | `usb-installer.img.gz.part*` + `usb-installer.img.bmap` | join with `cat usb-installer.img.gz.part* > usb-installer.img.gz` |'
+            else
+              row='| Station USB installer | `usb-installer.img.gz` + `usb-installer.img.bmap` | |'
+            fi
+          else
+            row=''
+          fi
+          notes="Automatically built from the tip of tfc-hmi \`main\` (${SRC_SHA:0:7}). Not a stable release.
+
+          | Platform | Asset | |
+          |---|---|---|
+          | macOS (Apple silicon) | \`centroidx_darwin_arm64.dmg\` | |
+          | Windows portable | \`centroidx_windows_x64.zip\` | |
+          | Windows sideload | \`centroidx_windows_amd64.msix\` + \`centroidx-sideload.cer\` | |
+          | Linux | \`centroidx_linux_x64.tar.gz\` | |
+          ${row}
+
+          centroidx-manager for Windows, macOS and Linux is attached as well. Checksums in \`SHA256SUMS.txt\`."
+
+          upload() {
+            local f=$1 attempt
+            for attempt in 1 2 3; do
+              if gh release upload main-latest --repo "$GITHUB_REPOSITORY" --clobber "$f"; then return 0; fi
+              echo "::warning::upload of $f failed (attempt $attempt)"; sleep $((attempt * 30))
+            done
+            return 1
+          }
+
+          gh release delete main-latest --repo "$GITHUB_REPOSITORY" --yes --cleanup-tag || true
+          gh release create main-latest --repo "$GITHUB_REPOSITORY" --target "$GITHUB_SHA" --prerelease \
+            --title "Latest main build" --notes "$notes"
+
+          failed=()
+          while read -r f; do upload "$f" || failed+=("$f"); done < <(ls -rS -- *)
+          if [ "${#failed[@]}" -gt 0 ]; then
+            echo "::error::failed to upload: ${failed[*]}"
+            exit 1
+          fi
