@@ -12,13 +12,16 @@ and tags come as `repository_dispatch`. A pull request comes as a mirror pull
 request: the bridge keeps a branch `tfc-hmi/pr-N` here whose one file,
 `tfc-hmi-source.json`, names the commit to test, force-pushes it on every push
 to the original, opens the mirror PR with no description, and closes it when
-the original closes.
+the original closes. tfc-hmi is private and this repository is not, so a
+mirror says only which pull request and which commit: it is titled `pr-N`, and
+neither its commit message nor `tfc-hmi-source.json` carries the original's
+title or branch name.
 
 ## What runs when
 
 | Event in tfc-hmi | Here | Result |
 |---|---|---|
-| pull request opened or pushed | `Tests`, on the mirror PR `tfc-hmi#N` here | every test suite, every build, image validation; checks on the mirror PR, verdict posted back to the original as the commit status `tfc-hmi-workflows / tests` |
+| pull request opened or pushed | `Tests`, on the mirror PR `pr-N` here | every test suite, every build, image validation; checks on the mirror PR, verdict posted back to the original as the commit status `tfc-hmi-workflows / tests` |
 | push to `main` | `Tests`, `Main Prerelease` | the `main-latest` prerelease of this repository is republished with all assets; `:latest`, `:latest-release` and `:latest-profile` images pushed to ghcr.io |
 | version tag `vYYYY.M.D` pushed | `Tag Release` | version written into `centroid-hmi/pubspec.yaml` and pushed to tfc-hmi main; a release with that tag is created here; `:stable` images pushed |
 | by hand | any workflow, with a `ref` | same as above for that ref; `Station image` can also publish a `station-v*` release of the OS image |

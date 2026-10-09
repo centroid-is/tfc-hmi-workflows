@@ -1,5 +1,11 @@
 name: Tests
 
+# The default run name of a pull_request run is the pull request's title. A
+# mirror's title is "pr-N" now, but the name is pinned here as well so that it
+# is the branch (tfc-hmi/pr-N) whatever the title says: this repository is
+# public and tfc-hmi is not.
+run-name: ${{ github.head_ref || github.event.action || github.event_name }}
+
 # Everything a pull request of tfc-hmi has to pass, plus the builds it must
 # prove it does not break.
 #
@@ -58,7 +64,7 @@ jobs:
             if [ -f tfc-hmi-source.json ]; then
               ref=$(jq -r .sha tfc-hmi-source.json); pr=$(jq -r .pr tfc-hmi-source.json); report=true
               repo=$(jq -r '.repository // empty' tfc-hmi-source.json); repo=${repo:-centroid-is/CentroidX}
-              echo "mirror of tfc-hmi#$pr: $(jq -r .title tfc-hmi-source.json)"
+              echo "mirror of tfc-hmi#$pr"
             else
               ref=main
               echo "a pull request of this repository: testing tfc-hmi main against it"

@@ -24,6 +24,12 @@
 #                           verdict comes back here as the commit status
 #                           "tfc-hmi-workflows / tests". Closing here closes
 #                           the mirror and deletes its branch.
+#
+# tfc-hmi-workflows is PUBLIC and tfc-hmi is not. The mirror therefore carries
+# the pull request's number and commit and nothing else: it is titled "pr-N",
+# has no description, and neither the source file nor the commit message names
+# the title or the branch. Do not add either back for convenience; a feature
+# name on a public pull request is a leak.
 
 name: Dispatch to tfc-hmi-workflows
 
@@ -76,9 +82,6 @@ jobs:
       ACTION: ${{ github.event.action }}
       PR_NUMBER: ${{ github.event.pull_request.number }}
       PR_SHA: ${{ github.event.pull_request.head.sha }}
-      PR_BRANCH: ${{ github.event.pull_request.head.ref }}
-      PR_TITLE: ${{ github.event.pull_request.title }}
-      PR_URL: ${{ github.event.pull_request.html_url }}
     steps:
       - name: Check out tfc-hmi-workflows
         uses: actions/checkout@v4
@@ -105,13 +108,14 @@ jobs:
           git config user.name "github-actions[bot]"
           git config user.email "github-actions[bot]@users.noreply.github.com"
           git checkout -B "$branch" origin/main
-          # gh's built-in jq writes the file, so the runner needs no jq.
+          # Number and commit only: this file is public. gh's built-in jq
+          # writes it, so the runner needs no jq.
           gh api "repos/$GITHUB_REPOSITORY/pulls/$PR_NUMBER" \
-            --jq '{repository: $ENV.GITHUB_REPOSITORY, sha: $ENV.PR_SHA, pr: $ENV.PR_NUMBER, branch: $ENV.PR_BRANCH, title: $ENV.PR_TITLE, url: $ENV.PR_URL}' \
+            --jq '{repository: $ENV.GITHUB_REPOSITORY, sha: $ENV.PR_SHA, pr: $ENV.PR_NUMBER}' \
             > tfc-hmi-source.json
           cat tfc-hmi-source.json
           git add tfc-hmi-source.json
-          git commit -m "tfc-hmi#$PR_NUMBER at ${PR_SHA:0:7}: $PR_TITLE"
+          git commit -m "pr-$PR_NUMBER at ${PR_SHA:0:7}"
           git push --force origin "$branch"
 
       - name: Open the mirror pull request if there is none
@@ -122,7 +126,9 @@ jobs:
           existing=$(gh pr list --repo "$WORKFLOWS_REPO" --head "$branch" --state open --json number -q '.[0].number')
           if [ -n "$existing" ]; then
             echo "mirror is $WORKFLOWS_REPO#$existing"
+            # A mirror opened before titles were withheld still carries one.
+            gh api -X PATCH "repos/$WORKFLOWS_REPO/pulls/$existing" -f title="pr-$PR_NUMBER" -f body="" --silent
             exit 0
           fi
           gh pr create --repo "$WORKFLOWS_REPO" --head "$branch" --base main \
-            --title "tfc-hmi#$PR_NUMBER: $PR_TITLE" --body ""
+            --title "pr-$PR_NUMBER" --body ""
