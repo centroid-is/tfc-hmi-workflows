@@ -218,6 +218,9 @@ jobs:
           echo "$ran tests ran"
           [ "$ran" -ge 220 ]
 
+  # packages/tfc_plant_sim exists only on branches that carry the fake
+  # plant (bench/fake-plant, CentroidX#588) until that lands on main; the
+  # job passes trivially where the package is absent.
   plant-sim-test:
     needs: context
     runs-on: ubuntu-latest
@@ -227,12 +230,19 @@ jobs:
         with:
           ref: ${{ needs.context.outputs.ref }}
           token: ${{ secrets.GH_PAT }}
-      - uses: dart-lang/setup-dart@v1
-      - uses: ./.github/actions/pub-get
+      - id: present
+        run: |
+          if [ -d src/packages/tfc_plant_sim ]; then echo present=true >> "$GITHUB_OUTPUT"
+          else echo present=false >> "$GITHUB_OUTPUT"; echo "::notice::packages/tfc_plant_sim is not on this ref; nothing to test"; fi
+      - if: steps.present.outputs.present == 'true'
+        uses: dart-lang/setup-dart@v1
+      - if: steps.present.outputs.present == 'true'
+        uses: ./.github/actions/pub-get
         with:
           command: dart pub get
           working-directory: src/packages/tfc_plant_sim
-      - working-directory: src/packages/tfc_plant_sim
+      - if: steps.present.outputs.present == 'true'
+        working-directory: src/packages/tfc_plant_sim
         run: |
           dart analyze
           dart test
