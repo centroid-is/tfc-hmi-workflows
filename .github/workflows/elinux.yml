@@ -10,6 +10,11 @@ name: Embedded Linux images
 #         :latest-profile (Dart VM service kept, for docker/profiler)
 #   tag   :<sha> and :stable, built in release mode
 #
+# A release or profile build also leaves the symbols of its Dart AOT library
+# (lib/libapp.so) in the package centroid-hmi-symbols, which is not public,
+# tagged with the library's build-id and with <sha>-<mode>; see "Keep the AOT
+# symbols".
+#
 # Called by test.yml (pr), main-prerelease.yml (main) and tag-release.yml (tag).
 
 on:
@@ -107,9 +112,20 @@ jobs:
       # The defines stay on the command line: tfc-hmi's
       # test/tools/shipped_feature_flags_test.dart reads this file and checks
       # every build line for them.
+      #
+      # --save-debugging-info has the Dart compiler write the symbols of
+      # lib/libapp.so (function names and source lines) to a file outside the
+      # bundle. The library itself comes out byte for byte as it does without
+      # the option, so nothing that ships changes. It is deliberately not
+      # --split-debug-info: that writes the same kind of file, but also makes
+      # every stack trace the app prints a list of addresses instead of
+      # function names. A debug build has no AOT library and ignores the
+      # option.
       - name: Build (${{ matrix.mode }})
         working-directory: src/centroid-hmi
-        run: flutter-elinux build elinux --${{ matrix.mode }} --dart-define=CENTROIDX_CHAT=false --dart-define=CENTROIDX_KNOWLEDGE=false
+        run: |
+          mkdir -p "$RUNNER_TEMP/aot-symbols"
+          flutter-elinux build elinux --${{ matrix.mode }} --dart-define=CENTROIDX_CHAT=false --dart-define=CENTROIDX_KNOWLEDGE=false --extra-gen-snapshot-options=--save-debugging-info="$RUNNER_TEMP/aot-symbols/app.linux-x64.symbols"
 
       - name: Collect the bundle
         working-directory: src/centroid-hmi
@@ -127,6 +143,70 @@ jobs:
             echo "::error::libflutter_engine.so carries no VM service; this is not a profile engine"
             exit 1
           fi
+
+      # The symbols go to ghcr.io as a one-file image in a package of their
+      # own. The organisation creates packages as Internal, readable by its
+      # members only, and this one must never be made public. Not an artifact:
+      # any signed-in GitHub user can download this repository's artifacts,
+      # and the bundle below is all they are meant to get.
+      #
+      # The image is tagged with the build-id of the libapp.so it belongs to,
+      # which is what a core file or a debugger names, and with <sha>-<mode>,
+      # which moves when the same commit is built again. Symbols whose
+      # build-id is not the library's would be worse than none, so a mismatch
+      # fails the job.
+      #
+      # This job runs in the toolchain container, which has no Docker; crane
+      # pushes an image without one.
+      - name: Keep the AOT symbols
+        if: matrix.mode != 'debug'
+        shell: bash
+        env:
+          GH_PAT: ${{ secrets.GH_PAT }}
+          IMG: ghcr.io/centroid-is/centroid-hmi-symbols
+          SHA: ${{ steps.src.outputs.sha }}
+          TAG: ${{ steps.src.outputs.short_sha }}-${{ matrix.mode }}
+          MODE: ${{ matrix.mode }}
+          CRANE_VERSION: v0.22.1
+          CRANE_SHA256: 0ab7a1d6932a213aed964ce97666c3077fe691c8606413674a8b3e0b9ec4cda0
+        run: |
+          set -euo pipefail
+          symbols="$RUNNER_TEMP/aot-symbols/app.linux-x64.symbols"
+          build_id_of() { readelf -n "$1" | sed -n 's/^ *Build ID: *//p' | head -n 1; }
+          build_id="$(build_id_of src/centroid-hmi/assets/lib/libapp.so)"
+          symbols_id="$(build_id_of "$symbols")"
+          if [ -z "$build_id" ] || [ "$build_id" != "$symbols_id" ]; then
+            echo "::error::libapp.so has build-id '$build_id' and the symbols file has '$symbols_id'; they must come from the same compile"
+            exit 1
+          fi
+
+          url="https://github.com/google/go-containerregistry/releases/download/$CRANE_VERSION/go-containerregistry_Linux_x86_64.tar.gz"
+          curl -fsSL --retry 3 -o "$RUNNER_TEMP/crane.tar.gz" "$url"
+          echo "$CRANE_SHA256  $RUNNER_TEMP/crane.tar.gz" | sha256sum -c -
+          tar -xzf "$RUNNER_TEMP/crane.tar.gz" -C "$RUNNER_TEMP" crane
+          crane="$RUNNER_TEMP/crane"
+          printf '%s' "$GH_PAT" | "$crane" auth login ghcr.io -u "$GITHUB_ACTOR" --password-stdin
+
+          tar -C "$RUNNER_TEMP/aot-symbols" -cf "$RUNNER_TEMP/aot-symbols.tar" app.linux-x64.symbols
+          labels=(
+            -l "org.opencontainers.image.source=https://github.com/centroid-is/CentroidX"
+            -l "org.opencontainers.image.revision=$SHA"
+            -l "is.centroid.aot.build-id=$build_id"
+            -l "is.centroid.aot.mode=$MODE"
+          )
+          push() {
+            "$crane" append --oci-empty-base -f "$RUNNER_TEMP/aot-symbols.tar" -t "$IMG:$build_id" &&
+            "$crane" mutate "$IMG:$build_id" -t "$IMG:$build_id" --set-platform linux/amd64 "${labels[@]}" &&
+            "$crane" tag "$IMG:$build_id" "$TAG"
+          }
+          # ghcr.io drops a push now and then; see docker-build-push.
+          if ! push; then
+            echo "::warning::pushing the symbols failed on the first attempt; retrying once."
+            sleep 20
+            push
+          fi
+          "$crane" auth logout ghcr.io
+          echo "kept the symbols of libapp.so $build_id ($(stat -c %s "$symbols") bytes) as $IMG:$build_id and $IMG:$TAG"
 
       - uses: actions/upload-artifact@v4
         with:
