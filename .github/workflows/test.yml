@@ -67,8 +67,10 @@ jobs:
           ref=''; pr=''; report=false; repo=centroid-is/CentroidX
           if [ "$GITHUB_EVENT_NAME" = pull_request ]; then
             if [ -f tfc-hmi-source.json ]; then
-              ref=$(jq -r .sha tfc-hmi-source.json); pr=$(jq -r .pr tfc-hmi-source.json); report=true
-              repo=$(jq -r '.repository // empty' tfc-hmi-source.json); repo=${repo:-centroid-is/CentroidX}
+              # Base64 of the JSON; a mirror written before that holds it plain.
+              src=$(base64 -d tfc-hmi-source.json 2>/dev/null | jq -ec . 2>/dev/null) || src=$(cat tfc-hmi-source.json)
+              ref=$(jq -r .sha <<<"$src"); pr=$(jq -r .pr <<<"$src"); report=true
+              repo=$(jq -r '.repository // empty' <<<"$src"); repo=${repo:-centroid-is/CentroidX}
               echo "mirror of tfc-hmi#$pr"
             else
               ref=main

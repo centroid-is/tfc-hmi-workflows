@@ -139,11 +139,11 @@ jobs:
             fi
           }
 
-          # Number and commit only: this file is public. gh's built-in jq
-          # writes it, so the runner needs no jq. Nothing is committed when
+          # Number and commit only, base64-encoded: this file is public. gh's
+          # built-in jq writes it, so the runner needs no jq. Nothing is committed when
           # the branch already names this commit.
           record() {
-            gh api "repos/$GITHUB_REPOSITORY/pulls/$PR_NUMBER"               --jq '{repository: $ENV.GITHUB_REPOSITORY, sha: $ENV.PR_SHA, pr: $ENV.PR_NUMBER}'               > tfc-hmi-source.json
+            gh api "repos/$GITHUB_REPOSITORY/pulls/$PR_NUMBER"               --jq '{repository: $ENV.GITHUB_REPOSITORY, sha: $ENV.PR_SHA, pr: $ENV.PR_NUMBER}'               | base64 -w0 > tfc-hmi-source.json
             git add tfc-hmi-source.json
             if git diff --cached --quiet; then
               echo "the mirror already names ${PR_SHA:0:7}; nothing to add"
@@ -166,7 +166,7 @@ jobs:
             echo "::error::could not push $branch to $WORKFLOWS_REPO without forcing, after 3 attempts"
             exit 1
           fi
-          cat tfc-hmi-source.json
+          base64 -d tfc-hmi-source.json; echo
           git log --oneline -5 "$branch"
 
           # A mirror that conflicts with main gets no pull_request runs, and
