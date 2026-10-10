@@ -1,0 +1,1 @@
+{"branch":"fix/panel-shm-size","pr":"623","repository":"centroid-is/CentroidX","sha":"417f053506ef0f20ef539df4daa5e39b4dc85812","title":"fix(station): the panel container gets 512 MB of /dev/shm","url":"https://github.com/centroid-is/CentroidX/pull/623"}
