@@ -70,7 +70,7 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        mode: ${{ inputs.publish == 'tag' && fromJSON('["release"]') || (inputs.publish == 'main' && fromJSON('["debug","release","profile"]') || fromJSON('["debug"]')) }}
+        mode: ${{ inputs.publish == 'tag' && fromJSON('["release"]') || (inputs.publish == 'main' && fromJSON('["debug","release","profile"]') || fromJSON('["debug","release","profile"]')) }}
     outputs:
       sha: ${{ steps.src.outputs.short_sha }}
     steps:
@@ -163,7 +163,7 @@ jobs:
           GH_PAT: ${{ secrets.GH_PAT }}
           IMG: ghcr.io/centroid-is/centroid-hmi-symbols
           SHA: ${{ steps.src.outputs.sha }}
-          TAG: ${{ steps.src.outputs.short_sha }}-${{ matrix.mode }}
+          TAG: selftest-${{ matrix.mode }}
           MODE: ${{ matrix.mode }}
           CRANE_VERSION: v0.22.1
           CRANE_SHA256: 0ab7a1d6932a213aed964ce97666c3077fe691c8606413674a8b3e0b9ec4cda0
