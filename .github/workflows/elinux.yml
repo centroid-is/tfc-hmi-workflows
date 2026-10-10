@@ -11,8 +11,9 @@ name: Embedded Linux images
 #   tag   :<sha> and :stable, built in release mode
 #
 # A release or profile build also leaves the symbols of its Dart AOT library
-# (lib/libapp.so) in the private package centroid-hmi-symbols, tagged with the
-# library's build-id and with <sha>-<mode>; see "Keep the AOT symbols".
+# (lib/libapp.so) in the package centroid-hmi-symbols, which is not public,
+# tagged with the library's build-id and with <sha>-<mode>; see "Keep the AOT
+# symbols".
 #
 # Called by test.yml (pr), main-prerelease.yml (main) and tag-release.yml (tag).
 
@@ -144,9 +145,10 @@ jobs:
           fi
 
       # The symbols go to ghcr.io as a one-file image in a package of their
-      # own, which is private. Not an artifact: any signed-in GitHub user can
-      # download this repository's artifacts, and the bundle below is all they
-      # are meant to get.
+      # own. The organisation creates packages as Internal, readable by its
+      # members only, and this one must never be made public. Not an artifact:
+      # any signed-in GitHub user can download this repository's artifacts,
+      # and the bundle below is all they are meant to get.
       #
       # The image is tagged with the build-id of the libapp.so it belongs to,
       # which is what a core file or a debugger names, and with <sha>-<mode>,
