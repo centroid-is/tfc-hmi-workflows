@@ -149,9 +149,14 @@ jobs:
       # Created empty first so README links resolve seconds after the delete,
       # then assets uploaded smallest first with --clobber (an upload can fail
       # after the asset was saved, which makes the retry a 422 duplicate).
+      #
+      # GH_PAT, not github.token: on 2026-10-14 the token deleted the release
+      # and was then refused the re-create (HTTP 403 "Resource not accessible
+      # by integration", the tag at a commit that changes a workflow file),
+      # which left no main-latest at all. The PAT carries the workflow scope.
       - name: Republish main-latest
         env:
-          GH_TOKEN: ${{ github.token }}
+          GH_TOKEN: ${{ secrets.GH_PAT }}
           SRC_SHA: ${{ needs.context.outputs.ref }}
         run: |
           set -uo pipefail
@@ -183,8 +188,18 @@ jobs:
           }
 
           gh release delete main-latest --repo "$GITHUB_REPOSITORY" --yes --cleanup-tag || true
-          gh release create main-latest --repo "$GITHUB_REPOSITORY" --target "$GITHUB_SHA" --prerelease \
-            --title "Latest main build" --notes "$notes"
+          # The release is gone from here on, so the create is retried rather
+          # than left to fail once.
+          created=
+          for attempt in 1 2 3; do
+            if gh release create main-latest --repo "$GITHUB_REPOSITORY" --target "$GITHUB_SHA" --prerelease \
+                --title "Latest main build" --notes "$notes"; then created=1; break; fi
+            echo "::warning::creating main-latest failed (attempt $attempt)"; sleep $((attempt * 20))
+          done
+          if [ -z "$created" ]; then
+            echo "::error::main-latest was deleted and could not be re-created: there is no main-latest now"
+            exit 1
+          fi
 
           failed=()
           while read -r f; do upload "$f" || failed+=("$f"); done < <(ls -rS -- *)
@@ -210,7 +225,7 @@ jobs:
           path: release/
       - name: Attach the station installer
         env:
-          GH_TOKEN: ${{ github.token }}
+          GH_TOKEN: ${{ secrets.GH_PAT }}
         run: |
           set -uo pipefail
           cd release
