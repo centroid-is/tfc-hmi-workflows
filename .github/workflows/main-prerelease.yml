@@ -72,8 +72,8 @@ jobs:
     with:
       ref: ${{ needs.context.outputs.ref }}
       publish: main
-  # Waited for, so the stick on main-latest is built from this commit, but
-  # its result does not gate the app assets.
+  # Attached to main-latest by publish-station once both it and the apps'
+  # publish are done; it gates nothing.
   station-image:
     needs: context
     uses: ./.github/workflows/station-image.yml
@@ -83,8 +83,15 @@ jobs:
       channel: prerelease
       preload: true
 
+  # The apps alone. The station image takes ~25 min longer than the slowest
+  # app and is ~3 GB to move, so waiting for it held every platform back by
+  # that much; publish-station attaches it afterwards.
+  #
+  # Still a delete and re-create, not uploads into a standing release: the
+  # app's updater and the manager both read a release's published_at as
+  # "a new build exists", and only a re-create moves it, once per commit.
   publish:
-    needs: [context, windows-build, macos-build, linux-build, manager-build, station-image]
+    needs: [context, windows-build, macos-build, linux-build, manager-build]
     if: >-
       !cancelled() &&
       needs.windows-build.result == 'success' &&
@@ -119,26 +126,10 @@ jobs:
           pattern: centroidx-manager_*
           path: manager/
           merge-multiple: true
-      - uses: actions/download-artifact@v4
-        continue-on-error: true
-        with:
-          name: station-usb-installer
-          path: release/
 
       - name: Assemble the release assets
         run: |
           set -euo pipefail
-          for f in usb-installer.img.gz usb-installer.img.bmap; do
-            if [ ! -f "release/$f" ]; then
-              found=$(find release -name "$f" | head -1 || true)
-              if [ -n "$found" ]; then echo "::warning::$f was nested at $found"; mv "$found" "release/$f"; fi
-            fi
-          done
-          # GitHub refuses assets of 2 GiB and more. 800 MB parts: 1.7 GB
-          # parts died with "HTTP 500: Error saving asset".
-          if [ -f release/usb-installer.img.gz ] && [ "$(stat -c %s release/usb-installer.img.gz)" -ge 2147483648 ]; then
-            (cd release && split -b 800000000 -d -a 2 usb-installer.img.gz usb-installer.img.gz.part && rm -f usb-installer.img.gz)
-          fi
           zip -qr release/centroidx_windows_x64.zip centroidx-windows-x64
           # The canonical name the manager looks for; msix:create emits centroidx.msix.
           mv msix/*.msix release/centroidx_windows_amd64.msix
@@ -146,14 +137,7 @@ jobs:
           cd release
           # Named, never globbed, so a missing asset fails here.
           sums=( centroidx_windows_x64.zip centroidx_windows_amd64.msix centroidx-sideload.cer centroidx_darwin_arm64.dmg centroidx_linux_x64.tar.gz centroidx-manager_windows_amd64.exe centroidx-manager_darwin_arm64.dmg centroidx-manager_linux_amd64 )
-          station=()
-          if ls usb-installer.img.gz* >/dev/null 2>&1 && [ -f usb-installer.img.bmap ]; then
-            station=( $(ls usb-installer.img.gz*) usb-installer.img.bmap )
-          else
-            echo "::warning::no complete station installer in this run (both halves or neither)"
-            rm -f usb-installer.img.gz* usb-installer.img.bmap
-          fi
-          sha256sum "${sums[@]}" "${station[@]}" > SHA256SUMS.txt
+          sha256sum "${sums[@]}" > SHA256SUMS.txt
           ls -la
 
       # Created empty first so README links resolve seconds after the delete,
@@ -166,16 +150,6 @@ jobs:
         run: |
           set -uo pipefail
           cd release
-          station=( $(ls usb-installer.img.gz* usb-installer.img.bmap 2>/dev/null || true) )
-          if [ "${#station[@]}" -gt 0 ]; then
-            if ls usb-installer.img.gz.part* >/dev/null 2>&1; then
-              row='| Station USB installer | `usb-installer.img.gz.part*` + `usb-installer.img.bmap` | join with `cat usb-installer.img.gz.part* > usb-installer.img.gz` |'
-            else
-              row='| Station USB installer | `usb-installer.img.gz` + `usb-installer.img.bmap` | |'
-            fi
-          else
-            row=''
-          fi
           notes="Automatically built from the tip of tfc-hmi \`main\` (${SRC_SHA:0:7}). Not a stable release.
 
           | Platform | Asset | |
@@ -184,7 +158,7 @@ jobs:
           | Windows portable | \`centroidx_windows_x64.zip\` | |
           | Windows sideload | \`centroidx_windows_amd64.msix\` + \`centroidx-sideload.cer\` | |
           | Linux | \`centroidx_linux_x64.tar.gz\` | |
-          ${row}
+          | Station USB installer | \`usb-installer.img.gz.part*\` + \`usb-installer.img.bmap\` | attached about 25 minutes after the rest; join with \`cat usb-installer.img.gz.part* > usb-installer.img.gz\`, checksums in \`SHA256SUMS-station.txt\` |
 
           centroidx-manager for Windows, macOS and Linux is attached as well. Checksums in \`SHA256SUMS.txt\`."
 
@@ -201,6 +175,59 @@ jobs:
           gh release create main-latest --repo "$GITHUB_REPOSITORY" --target "$GITHUB_SHA" --prerelease \
             --title "Latest main build" --notes "$notes"
 
+          failed=()
+          while read -r f; do upload "$f" || failed+=("$f"); done < <(ls -rS -- *)
+          if [ "${#failed[@]}" -gt 0 ]; then
+            echo "::error::failed to upload: ${failed[*]}"
+            exit 1
+          fi
+
+  # The stick, onto the release publish just made. Needs publish so its
+  # delete cannot take the stick with it, and fails alone: a missing stick
+  # leaves the apps' release as it is.
+  publish-station:
+    needs: [context, publish, station-image]
+    if: >-
+      !cancelled() &&
+      needs.publish.result == 'success' &&
+      needs.station-image.result == 'success'
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          name: station-usb-installer
+          path: release/
+      - name: Attach the station installer
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -uo pipefail
+          cd release
+          for f in usb-installer.img.gz usb-installer.img.bmap; do
+            if [ ! -f "$f" ]; then
+              found=$(find . -name "$f" | head -1 || true)
+              if [ -n "$found" ]; then echo "::warning::$f was nested at $found"; mv "$found" "$f"; fi
+            fi
+          done
+          if [ ! -f usb-installer.img.gz ] || [ ! -f usb-installer.img.bmap ]; then
+            echo "::error::the station-usb-installer artifact lacks the image or its bmap"; exit 1
+          fi
+          # GitHub refuses assets of 2 GiB and more. 800 MB parts: 1.7 GB
+          # parts died with "HTTP 500: Error saving asset".
+          if [ "$(stat -c %s usb-installer.img.gz)" -ge 2147483648 ]; then
+            split -b 800000000 -d -a 2 usb-installer.img.gz usb-installer.img.gz.part && rm -f usb-installer.img.gz
+          fi
+          sha256sum usb-installer.img.gz* usb-installer.img.bmap > SHA256SUMS-station.txt
+          ls -la
+
+          upload() {
+            local f=$1 attempt
+            for attempt in 1 2 3; do
+              if gh release upload main-latest --repo "$GITHUB_REPOSITORY" --clobber "$f"; then return 0; fi
+              echo "::warning::upload of $f failed (attempt $attempt)"; sleep $((attempt * 30))
+            done
+            return 1
+          }
           failed=()
           while read -r f; do upload "$f" || failed+=("$f"); done < <(ls -rS -- *)
           if [ "${#failed[@]}" -gt 0 ]; then
