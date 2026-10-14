@@ -31,9 +31,15 @@ jobs:
     outputs:
       ref: ${{ steps.ctx.outputs.ref }}
     steps:
+      # Resolved to the full sha: a hand run passes a branch name, and the
+      # release notes name the exact commit for the app's updater (below).
       - id: ctx
+        env:
+          GH_TOKEN: ${{ secrets.GH_PAT }}
+          REF: ${{ github.event.client_payload.sha || inputs.ref }}
         run: |
-          ref='${{ github.event.client_payload.sha || inputs.ref }}'
+          set -euo pipefail
+          ref=$(gh api "repos/centroid-is/CentroidX/commits/$REF" --jq .sha)
           echo "ref=$ref" >> "$GITHUB_OUTPUT"
           echo "publishing tfc-hmi $ref as main-latest"
 
@@ -150,7 +156,12 @@ jobs:
         run: |
           set -uo pipefail
           cd release
+          # The marker is how the app's latest channel knows which tfc-hmi
+          # commit this is: the release's own target is a commit of THIS
+          # repository and never matches the app's GIT_SHA. Hidden when the
+          # notes render.
           notes="Automatically built from the tip of tfc-hmi \`main\` (${SRC_SHA:0:7}). Not a stable release.
+          <!-- tfc-hmi-sha: ${SRC_SHA} -->
 
           | Platform | Asset | |
           |---|---|---|
