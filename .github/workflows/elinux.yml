@@ -1,10 +1,12 @@
 name: Embedded Linux images
 
 # The station images on ghcr.io: centroid-hmi (the flutter-elinux bundle in
-# docker/frontend), centroid-backend (docker/backend) and hmi-profiler
-# (docker/profiler). Which tags are pushed depends on `publish`:
+# docker/frontend), centroid-backend (docker/backend), centroid-web (the
+# browser bundle in docker/web) and hmi-profiler (docker/profiler). Which
+# tags are pushed depends on `publish`:
 #
-#   pr    centroid-hmi:pr-N, centroid-backend:pr-N, hmi-profiler:pr-N
+#   pr    centroid-hmi:pr-N, centroid-backend:pr-N, centroid-web:pr-N,
+#         hmi-profiler:pr-N
 #   main  :<sha> and :latest (a DEBUG Flutter build), plus :<sha>-release /
 #         :latest-release (production mode) and :<sha>-profile /
 #         :latest-profile (Dart VM service kept, for docker/profiler)
@@ -300,6 +302,79 @@ jobs:
           file: src/docker/backend/Dockerfile
           target: profile
           tags: ${{ steps.tags.outputs.profile }}
+
+  # The browser client: `flutter build web` on the runner, then nginx in
+  # docker/web serves the bundle. Same tags as the backend. One build mode
+  # only (release); the station's compose references centroid-web:latest, so
+  # main must always publish it or the station image cannot be preloaded.
+  web-build:
+    name: web bundle
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: ./.github/actions/checkout-source
+        with:
+          ref: ${{ inputs.ref }}
+          token: ${{ secrets.GH_PAT }}
+      - uses: ./.github/actions/setup-flutter
+      - uses: ./.github/actions/pub-get
+        with:
+          working-directory: src/centroid-hmi
+      # --no-tree-shake-icons: the web icon shaker drops Font Awesome glyphs
+      # the bundle draws. The defines stay on the command line for
+      # shipped_feature_flags_test.dart.
+      - name: Build
+        working-directory: src/centroid-hmi
+        run: flutter build web -t lib/main_web.dart --release --no-tree-shake-icons --dart-define=CENTROIDX_CHAT=false --dart-define=CENTROIDX_KNOWLEDGE=false
+      # The gateway address is filled in by the container at start; a bundle
+      # with it substituted at build time would point every station at one.
+      - name: The gateway declaration is still a placeholder
+        working-directory: src/centroid-hmi
+        run: |
+          if ! grep -q 'content="$CENTROIDX_GATEWAY"' build/web/index.html; then
+            echo "::error::build/web/index.html lost its centroidx-gateway placeholder"
+            exit 1
+          fi
+      - uses: actions/upload-artifact@v4
+        with:
+          name: centroid-web-bundle
+          path: src/centroid-hmi/build/web
+
+  web-image:
+    name: centroid-web image
+    needs: web-build
+    if: inputs.publish != 'pr' || inputs.pr_number != ''
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - id: src
+        uses: ./.github/actions/checkout-source
+        with:
+          ref: ${{ inputs.ref }}
+          token: ${{ secrets.GH_PAT }}
+      - uses: actions/download-artifact@v4
+        with:
+          name: centroid-web-bundle
+          path: src/docker/web/bundle
+      - uses: ./.github/actions/ghcr-login
+        with:
+          token: ${{ secrets.GH_PAT }}
+      - name: Choose the tags
+        id: tags
+        env:
+          SHA: ${{ steps.src.outputs.short_sha }}
+          IMG: ghcr.io/centroid-is/centroid-web
+        run: |
+          case "${{ inputs.publish }}" in
+            pr)   tags="$IMG:pr-${{ inputs.pr_number }}" ;;
+            main) tags="$IMG:$SHA"$'\n'"$IMG:latest" ;;
+            tag)  tags="$IMG:$SHA"$'\n'"$IMG:stable" ;;
+          esac
+          { echo 'tags<<EOF'; echo "$tags"; echo 'EOF'; } >> "$GITHUB_OUTPUT"
+      - uses: ./.github/actions/docker-build-push
+        with:
+          context: src/docker/web
+          tags: ${{ steps.tags.outputs.tags }}
 
   # python:alpine plus a stdlib script; built on every PR so docker/profiler
   # does not rot.
