@@ -36,6 +36,11 @@ on:
         description: tfc-hmi commit, branch or tag to test
         type: string
         default: main
+      # Keep it a string: a boolean input is the string "false" in an `if:`.
+      seed:
+        description: Seed for the 35-minute relay soak; 11 is the lane's own, a failed run's repro.log names the one to reproduce.
+        type: string
+        default: '11'
 
 permissions:
   contents: read
@@ -234,9 +239,8 @@ jobs:
           echo "$ran tests ran"
           [ "$ran" -ge 220 ]
 
-  # packages/tfc_plant_sim exists only on branches that carry the fake
-  # plant (bench/fake-plant, CentroidX#588) until that lands on main; the
-  # job passes trivially where the package is absent.
+  # packages/tfc_plant_sim is on main since #463; the job still passes
+  # trivially on an older ref without it.
   plant-sim-test:
     needs: context
     runs-on: ubuntu-latest
@@ -356,6 +360,42 @@ jobs:
         env:
           TIMESCALEDB_EXTERNAL: ${{ matrix.timescaledb_external }}
         run: dart test
+
+      # The relay's db-tagged legs, against the database this job already
+      # has (ubuntu: the tests' own Compose stack; macOS/Windows: the native
+      # server above). Each count floor catches a tag that selects nothing,
+      # which `dart test` reports as green.
+      - name: tfc_relay_local db lane
+        working-directory: src/packages/tfc_relay_local
+        env:
+          TIMESCALEDB_EXTERNAL: ${{ matrix.timescaledb_external }}
+        run: |
+          dart pub get
+          dart test --tags db --file-reporter "json:test-report.json"
+      - name: At least 120 relay db tests ran
+        if: always()
+        shell: bash
+        working-directory: src/packages/tfc_relay_local
+        run: |
+          [ -f test-report.json ] || { echo "::error::the db lane produced no report"; exit 1; }
+          total=$( { grep -o '"type":"testStart"' test-report.json || true; } | wc -l)
+          loading=$( { grep -o '"name":"loading ' test-report.json || true; } | wc -l)
+          ran=$((total - loading))
+          echo "$ran relay db tests ran (148 when the floor was set)"
+          [ "$ran" -ge 120 ]
+      - name: tfc_relay_local gate db leg
+        shell: bash
+        working-directory: src/packages/tfc_relay_local
+        env:
+          TIMESCALEDB_EXTERNAL: ${{ matrix.timescaledb_external }}
+        run: |
+          dart test test/gate --tags db --file-reporter "json:gate-db-report.json"
+          total=$( { grep -o '"type":"testStart"' gate-db-report.json || true; } | wc -l)
+          loading=$( { grep -o '"name":"loading ' gate-db-report.json || true; } | wc -l)
+          ran=$((total - loading))
+          echo "$ran gate db tests ran"
+          [ "$ran" -ge 1 ]
+
       - if: always()
         uses: actions/upload-artifact@v4
         with:
@@ -365,6 +405,328 @@ jobs:
             src/packages/tfc_dart/test-results/
           if-no-files-found: ignore
           retention-days: 30
+
+  # The relay packages, one after another in one job: they bind ports and
+  # measure milliseconds, so two of them on one runner at once are a flake.
+  # The `floor` helper reads a JSON report and fails if fewer than N tests
+  # started: a tag or path that selects nothing is green in `dart test`.
+  relay-packages-test:
+    name: relay-packages-test (${{ matrix.os }})
+    needs: context
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-latest, windows-latest]
+    defaults:
+      run:
+        shell: bash
+    env:
+      FLOOR: |
+        floor() {
+          [ -f "$1" ] || { echo "::error::no $1 - the step produced no report"; exit 1; }
+          local total loading ran
+          total=$( { grep -o '"type":"testStart"' "$1" || true; } | wc -l)
+          loading=$( { grep -o '"name":"loading ' "$1" || true; } | wc -l)
+          ran=$((total - loading))
+          echo "$1: $ran tests ran (floor $2)"
+          [ "$ran" -ge "$2" ] || { echo "::error::$1: only $ran tests ran, expected at least $2"; exit 1; }
+        }
+    steps:
+      - uses: actions/checkout@v4
+      - uses: ./.github/actions/checkout-source
+        with:
+          ref: ${{ needs.context.outputs.ref }}
+          token: ${{ secrets.GH_PAT }}
+      - uses: dart-lang/setup-dart@v1
+
+      - name: tfc_relay_protocol
+        working-directory: src/packages/tfc_relay_protocol
+        run: |
+          dart pub get
+          dart analyze
+          dart test
+      # dart2js only: it coerces bitwise operators to 32 bits, which the VM
+      # and dart2wasm never show. Scoped to the files that are web-clean.
+      - name: tfc_relay_protocol on dart2js
+        if: runner.os == 'Linux'
+        working-directory: src/packages/tfc_relay_protocol
+        run: |
+          eval "$FLOOR"
+          dart test -p chrome test/ulid_web_test.dart test/write_outcome_log_web_test.dart --file-reporter "json:web-report.json"
+          floor web-report.json 14
+
+      - name: tfc_stateman_contract
+        working-directory: src/packages/tfc_stateman_contract
+        run: |
+          dart pub get
+          dart analyze
+          dart test --exclude-tags oslevel
+      # tc netem needs root and iproute2; only ubuntu has both. The tests
+      # skip by name if passwordless sudo ever goes away.
+      - name: tfc_stateman_contract OS-level faults
+        if: runner.os == 'Linux'
+        working-directory: src/packages/tfc_stateman_contract
+        run: |
+          command -v tc >/dev/null || { sudo apt-get update && sudo apt-get install -y iproute2; }
+          dart test --tags oslevel
+      - name: Fault-lane wall-clock budget
+        if: runner.os == 'Linux'
+        working-directory: src/packages/tfc_stateman_contract
+        env:
+          FAULT_LANE_BUDGET: '1'
+        run: dart test test/faults/mode_integrity_test.dart
+
+      - name: tfc_relay_server
+        working-directory: src/packages/tfc_relay_server
+        run: |
+          dart pub get
+          dart analyze
+          dart test
+
+      - name: tfc_relay_client
+        working-directory: src/packages/tfc_relay_client
+        run: |
+          dart pub get
+          dart analyze
+          dart test
+      - name: tfc_relay_client on dart2js
+        if: runner.os == 'Linux'
+        working-directory: src/packages/tfc_relay_client
+        run: |
+          eval "$FLOOR"
+          dart test -p chrome test/web/ --file-reporter "json:web-report.json"
+          floor web-report.json 5
+      # Measures the gate lane; it does not select. The test clears the
+      # variable in the child it spawns and the child excludes the `meta`
+      # tag; renaming that tag makes this recurse without end.
+      - name: Gate-lane wall-clock budget
+        if: runner.os == 'Linux'
+        working-directory: src/packages/tfc_relay_client
+        env:
+          GATE_LANE_BUDGET: '1'
+        run: dart test test/gate/gate_manifest_test.dart
+
+      # Builds the open62541 native asset. A failure with no test output is
+      # usually the download flaking: re-run before reading the diff. db legs
+      # run in tfc-dart-test, which has the database; soak runs next.
+      - name: tfc_relay_local
+        working-directory: src/packages/tfc_relay_local
+        run: |
+          dart pub get
+          dart analyze
+          dart test --exclude-tags "db || soak"
+      # The soak's 90-second arm, so the machinery cannot rot between full
+      # runs. Its timeout and @Timeout on soak_test.dart move together.
+      - name: Chaos soak (90 s arm)
+        working-directory: src/packages/tfc_relay_local
+        timeout-minutes: 15
+        run: |
+          eval "$FLOOR"
+          dart test test/soak --tags soak --file-reporter "json:soak-report.json"
+          floor soak-report.json 180
+      - name: Gate-B-lane wall-clock budget
+        if: runner.os == 'Linux'
+        working-directory: src/packages/tfc_relay_local
+        env:
+          GATE_B_LANE_BUDGET: '1'
+        run: dart test test/gate/gate_b_manifest_test.dart
+
+  # The soak's 35-minute arm and the gate arms at full length, on every push
+  # to main and on demand; never on a pull request (the 90 s arm above is the
+  # PR's). Coalesces to the newest push. Ubuntu only: the socket-count
+  # invariant cannot be judged on Windows. Not in `report`, which reads a
+  # skip as a failure.
+  relay-soak:
+    name: relay soak (35 min)
+    needs: context
+    if: github.event_name != 'pull_request'
+    concurrency:
+      group: tests-relay-soak
+      cancel-in-progress: true
+    runs-on: ubuntu-latest
+    # The library @Timeout(45 min) must fire first, so the failure has a
+    # journal behind it.
+    timeout-minutes: 60
+    defaults:
+      run:
+        shell: bash
+    env:
+      FLOOR: |
+        floor() {
+          [ -f "$1" ] || { echo "::error::no $1 - the step produced no report"; exit 1; }
+          local total loading ran
+          total=$( { grep -o '"type":"testStart"' "$1" || true; } | wc -l)
+          loading=$( { grep -o '"name":"loading ' "$1" || true; } | wc -l)
+          ran=$((total - loading))
+          echo "$1: $ran tests ran (floor $2)"
+          [ "$ran" -ge "$2" ] || { echo "::error::$1: only $ran tests ran, expected at least $2"; exit 1; }
+        }
+    steps:
+      - uses: actions/checkout@v4
+      - uses: ./.github/actions/checkout-source
+        with:
+          ref: ${{ needs.context.outputs.ref }}
+          token: ${{ secrets.GH_PAT }}
+      - uses: dart-lang/setup-dart@v1
+      - name: Chaos soak (35 min arm)
+        working-directory: src/packages/tfc_relay_local
+        env:
+          RELAY_SOAK: '1'
+          RELAY_SOAK_SEED: ${{ inputs.seed || '11' }}
+        run: |
+          eval "$FLOOR"
+          dart pub get
+          dart test test/soak --tags soak --file-reporter "json:soak-report.json"
+          floor soak-report.json 180
+      - name: Gate arms at full duration
+        if: always()
+        working-directory: src/packages/tfc_relay_client
+        env:
+          RELAY_SOAK: '1'
+        run: |
+          eval "$FLOOR"
+          dart pub get
+          dart test test/gate --tags gate --file-reporter "json:gate-report.json"
+          floor gate-report.json 76
+      # A green run's journal is the baseline a red one is read against.
+      - if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: relay-soak-seed-${{ inputs.seed || '11' }}-${{ github.run_id }}
+          path: src/packages/tfc_relay_local/build/soak/
+          retention-days: 7
+          if-no-files-found: error
+
+  # Mimic widgets over the real relay client, gateway, open62541 servers and
+  # an M2400 stub, in one process. Opt-in by env var and --concurrency=1:
+  # the plant iterates on a blocking 10 ms FFI timer and starves alongside
+  # other suites. No skip is tolerated.
+  e2e-assets-test:
+    needs: context
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v4
+      - uses: ./.github/actions/checkout-source
+        with:
+          ref: ${{ needs.context.outputs.ref }}
+          token: ${{ secrets.GH_PAT }}
+      - uses: ./.github/actions/setup-flutter
+      - run: sudo apt-get install -y libglib2.0-dev
+      - uses: ./.github/actions/pub-get
+        with:
+          working-directory: src
+      - name: e2e_assets
+        working-directory: src
+        env:
+          CENTROIDX_E2E_ASSETS: '1'
+        run: flutter test test/e2e_assets/ --concurrency=1 --file-reporter "json:e2e-assets-report.json"
+      - name: At least 6 cases ran, none skipped
+        if: always()
+        working-directory: src
+        run: |
+          python3 - <<'PY'
+          import json, sys
+          ran = skipped = 0
+          for line in open('e2e-assets-report.json', encoding='utf-8'):
+              if not line.startswith('{'):
+                  continue
+              ev = json.loads(line)
+              if ev.get('type') == 'testStart':
+                  t = ev.get('test', {})
+                  if t.get('name', '').startswith('loading '):
+                      continue
+                  ran += 1
+                  skipped += bool((t.get('metadata') or {}).get('skip'))
+          print(f"e2e_assets: {ran} started, {skipped} skipped")
+          if skipped or ran < 6:
+              print("::error::expected 6 cases and no skips: CENTROIDX_E2E_ASSETS is not reaching the tests, or a case stopped running")
+              sys.exit(1)
+          PY
+
+  # Eleven /advanced/* routes over the real relay, against a real backend on
+  # a Postgres the tests bring up in Docker (ubuntu only). Run again under a
+  # non-UTC clock, which found a text-compared timestamp once. Cases named
+  # KNOWN RED assert a fix not yet made: they run only with the second
+  # switch, and one that passes must be promoted.
+  e2e-pages-test:
+    needs: context
+    runs-on: ubuntu-latest
+    timeout-minutes: 40
+    steps:
+      - uses: actions/checkout@v4
+      - uses: ./.github/actions/checkout-source
+        with:
+          ref: ${{ needs.context.outputs.ref }}
+          token: ${{ secrets.GH_PAT }}
+      - uses: ./.github/actions/setup-flutter
+      - run: sudo apt-get install -y libglib2.0-dev
+      - uses: ./.github/actions/pub-get
+        with:
+          working-directory: src
+      - name: e2e_pages
+        working-directory: src
+        env:
+          CENTROIDX_E2E_PAGES: '1'
+        run: flutter test test/e2e_pages --concurrency=1 --file-reporter "json:e2e-pages-report.json"
+      - name: At least 51 cases ran green, no unexplained skips
+        if: always()
+        working-directory: src
+        run: |
+          python3 - <<'PY'
+          import json, sys
+          ran = known_red = other = 0
+          for line in open('e2e-pages-report.json', encoding='utf-8'):
+              if not line.startswith('{'):
+                  continue
+              ev = json.loads(line)
+              if ev.get('type') != 'testStart':
+                  continue
+              t = ev.get('test', {}); n = t.get('name', '')
+              if n.startswith('loading ') or n.endswith('(setUpAll)') or n.endswith('(tearDownAll)'):
+                  continue
+              ran += 1
+              if (t.get('metadata') or {}).get('skip'):
+                  if 'KNOWN RED' in n: known_red += 1
+                  else: other += 1
+          green = ran - known_red - other
+          print(f"e2e_pages: {ran} started, {green} green, {known_red} known-red, {other} other skips")
+          if other or green < 51:
+              print("::error::expected 51 green and no other skips: CENTROIDX_E2E_PAGES is not reaching the tests, or a case stopped running")
+              sys.exit(1)
+          PY
+      - name: e2e_pages under a clock that is not UTC
+        if: always()
+        working-directory: src
+        env:
+          CENTROIDX_E2E_PAGES: '1'
+          TZ: Europe/Copenhagen
+        run: flutter test test/e2e_pages --concurrency=1
+      - name: Known-red cases are still red
+        if: always()
+        working-directory: src
+        env:
+          CENTROIDX_E2E_PAGES: '1'
+          CENTROIDX_E2E_PAGES_KNOWN_RED: '1'
+        run: |
+          flutter test test/e2e_pages --concurrency=1 --file-reporter "json:e2e-pages-knownred.json" || true
+          python3 - <<'PY'
+          import json, sys
+          names, results = {}, {}
+          for line in open('e2e-pages-knownred.json', encoding='utf-8'):
+              if not line.startswith('{'):
+                  continue
+              ev = json.loads(line)
+              if ev.get('type') == 'testStart':
+                  names[ev['test']['id']] = ev['test'].get('name', '')
+              elif ev.get('type') == 'testDone' and not ev.get('hidden'):
+                  results[ev.get('testID')] = ev.get('result')
+          now_green = [n for i, n in names.items() if 'KNOWN RED' in n and results.get(i) == 'success']
+          for n in now_green:
+              print(f"::error::this KNOWN RED case now passes; promote it to a normal case: {n}")
+          sys.exit(1 if now_green else 0)
+          PY
 
   windows-runner-cpp-test:
     name: windows-runner-cpp-test (${{ matrix.os }})
@@ -526,6 +888,9 @@ jobs:
       - plant-sim-test
       - centroidx-upgrader-test
       - tfc-dart-test
+      - relay-packages-test
+      - e2e-assets-test
+      - e2e-pages-test
       - windows-runner-cpp-test
       - elinux-video-plugin-cpp-test
       - webview-cef-cpp-test

@@ -80,16 +80,35 @@ jobs:
           docker run --rm -v "$PWD:/w" -w /w koalaman/shellcheck@sha256:bb596a0d169b85ddd81d8b6d3a2ff6d5baf5fca10b97f575ebc647c3dff62b3d \
             scripts/*.sh test/*.sh \
             overlays/base/usr/local/bin/centroidx-firstboot \
+            overlays/base/usr/local/bin/centroid-crash-handler.sh \
+            overlays/base/usr/local/bin/centroid-deathwatch.sh \
             overlays/installer/usr/local/bin/centroidx-install \
             overlays/installer/usr/local/bin/centroidx-install-failsafe \
             overlays/installer/usr/local/bin/centroidx-gui-launch \
             overlays/installer/usr/local/bin/centroidx-remote-access
 
-      - name: Installer and firmware tests
+      # bash, systemd and sysctl all break on a CR, and say little about it
+      # (`syntax error near unexpected token $'in\r'`). .gitattributes pins
+      # os/ to LF; this asks the index, so a Windows clone cannot hide it.
+      - name: No CRLF in anything the station executes
+        working-directory: src
+        run: |
+          set -uo pipefail
+          bad=0
+          while read -r eol path; do
+            case "$eol" in
+              i/lf|i/none|i/-text) ;;
+              *) echo "::error file=$path::$eol in the index; pin it to eol=lf in .gitattributes"; bad=1 ;;
+            esac
+          done < <(git ls-files --eol -- 'os/scripts/*' 'os/test/*' 'os/overlays/*' | awk '{ print $1, $NF }')
+          exit $bad
+
+      - name: Installer, first-boot and firmware tests
         working-directory: src/os
         run: |
           sudo apt-get install -y wireguard-tools
           bash test/installer-test.sh
+          bash test/firstboot-test.sh
           bash test/gpu-firmware-test.sh
 
       - name: Archive keys unchanged
@@ -281,11 +300,74 @@ jobs:
           ck "test -f $C" "no generated compose at $C"
           ck "! grep -Eq 'centroid-hmi:latest[[:space:]]*$' $C" "compose points at centroid-hmi:latest, the debug build"
           if [ "${{ inputs.channel || 'prerelease' }}" = stable ]; then
-            for i in centroid-hmi:stable centroid-backend:stable hmi-profiler:stable; do ck "grep -q '$i' $C" "compose lacks $i"; done
+            for i in centroid-hmi:stable centroid-backend:stable centroid-web:stable hmi-profiler:stable; do ck "grep -q '$i' $C" "compose lacks $i"; done
+            # Every image built from tfc-hmi follows the channel; one left at
+            # :latest is a main build on a stable station.
+            ck "! grep -Eq 'ghcr.io/centroid-is/(centroid-[a-z]+|hmi-profiler):latest' $C" "a tfc-hmi image is still at :latest on the stable channel"
           else
             ck "grep -q 'centroid-hmi:latest-release' $C" "compose lacks centroid-hmi:latest-release"
           fi
           for i in weston:latest novnc:latest docker-update:latest; do ck "grep -q '$i' $C" "compose lacks $i"; done
+
+          # The front door. Docker turns a missing bind source into an empty
+          # directory, and caddy then exits with the browser HMI simply absent.
+          F=overlays/generated/home/centroid/docker/caddy/Caddyfile
+          ck "test -s $F" "no Caddyfile staged beside the compose"
+          ck "grep -q './docker/caddy/Caddyfile:/etc/caddy/Caddyfile' $C" "compose does not mount the staged Caddyfile"
+          ck "grep -Eq '^\s+- 81:81\s*$' $C" "caddy does not publish 81"
+          ck "grep -Eq '^\s+- 82:82\s*$' $C" "caddy does not publish 82"
+          ck "grep -Eq 'image:\s*caddy:[0-9]+\.[0-9]+' $C" "caddy is not pinned to a minor version"
+          ck "grep -q 'default_sni {\$STATION_ADDRESS}' $F" "the Caddyfile is not parameterised by STATION_ADDRESS"
+          ck "! grep -Eq '(^|[^0-9.])([0-9]{1,3}\.){3}[0-9]{1,3}([^0-9.]|$)' $F" "the Caddyfile names a literal IPv4 address"
+          # Reached through caddy only; published they are plain HTTP/WS on the LAN.
+          ck "! grep -Eq '^\s+- \"?9443:9443' $C" "the relay port 9443 is published"
+          ck "! grep -Eq '^\s+- \"?8090:80' $C" "centroidx-web publishes its own port"
+          exit $fail
+
+      # The container crash recorder, on the mounted station image: every
+      # piece of it fails silently on a station (a non-executable core
+      # handler drops the dump, a unit never enabled never runs).
+      - name: The station image records container crashes and exits
+        run: |
+          set +e
+          set -uo pipefail
+          gz=$(ls out/centroidx-*.img.gz 2>/dev/null | head -1)
+          [ -n "$gz" ] || { echo "::error::no station image in os/out/"; exit 1; }
+          raw="$RUNNER_TEMP/station.img"; mnt="$RUNNER_TEMP/station-mnt"
+          gunzip -c "$gz" | dd of="$raw" bs=4M conv=sparse status=none
+          loop=$(sudo losetup -f --show -P "$raw")
+          sudo udevadm settle
+          mkdir -p "$mnt"
+          if ! sudo mount -o ro "${loop}p2" "$mnt"; then
+            echo "::error::could not mount the station rootfs ${loop}p2"; lsblk "$loop" || true
+            sudo losetup -d "$loop"; rm -f "$raw"; exit 1
+          fi
+          fail=0
+          t() { if ! sudo bash -c "$1"; then echo "::error::$2"; fail=1; fi; }
+          W=$mnt/etc/systemd/system/multi-user.target.wants
+          U=$mnt/etc/systemd/system/centroid-deathwatch.service
+          S=$mnt/etc/sysctl.d/60-centroid-cores.conf
+          R=$mnt/etc/logrotate.d/centroid
+          t "test -x $mnt/usr/local/bin/centroid-crash-handler.sh" "crash handler missing or not executable"
+          t "test -x $mnt/usr/local/bin/centroid-deathwatch.sh" "deathwatch missing or not executable"
+          # -L: the enable symlink is absolute and resolves against the runner.
+          t "test -L $W/centroid-deathwatch.service" "deathwatch not enabled"
+          t "grep -q '^Requires=docker.service' $U" "deathwatch does not require docker"
+          t "grep -q '^Restart=always' $U" "deathwatch does not restart with the daemon"
+          t "grep -q 'core_pattern=|.* %e %p %s %t %E\$' $S" "core_pattern does not pipe %e %p %s %t %E to a handler"
+          h=$(sed -n 's/^kernel.core_pattern=|\([^ ]*\).*/\1/p' "$S")
+          t "test -n '$h' && test -x '$mnt$h'" "the core_pattern handler '$h' is not executable in the image"
+          t "test -x $mnt/usr/bin/gdb -o -x $mnt/bin/gdb" "no gdb, so cores are not symbolised"
+          t "test -d $mnt/var/log/centroid/cores" "no /var/log/centroid/cores"
+          t "grep -q '^/var/log/centroid/crashes.log\$' $R" "no logrotate entry for crashes.log"
+          t "grep -q '^/var/log/centroid/deaths.log\$' $R" "no logrotate entry for deaths.log"
+          t "test -x $mnt/usr/sbin/logrotate -o -x $mnt/sbin/logrotate" "logrotate not installed"
+          t "test -L $mnt/etc/systemd/system/timers.target.wants/logrotate.timer" "logrotate timer not enabled"
+          for f in usr/local/bin/centroid-crash-handler.sh usr/local/bin/centroid-deathwatch.sh \
+                   etc/systemd/system/centroid-deathwatch.service etc/sysctl.d/60-centroid-cores.conf; do
+            t "! LC_ALL=C grep -qU \$'\r' $mnt/$f" "CRLF in $f"
+          done
+          sudo umount "$mnt"; sudo losetup -d "$loop"; rm -f "$raw"
           exit $fail
 
       # PRELOAD again: the Makefile derives USBSIZE from it (8GB or 4GB).
