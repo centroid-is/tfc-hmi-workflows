@@ -1,14 +1,19 @@
 name: Embedded Linux images
 
 # The station images on ghcr.io: centroid-hmi (the flutter-elinux bundle in
-# docker/frontend), centroid-backend (docker/backend) and hmi-profiler
-# (docker/profiler). Which tags are pushed depends on `publish`:
+# docker/frontend), centroid-backend (docker/backend), hmi-profiler
+# (docker/profiler) and centroid-web (the browser client in docker/web). Which
+# tags are pushed depends on `publish`:
 #
-#   pr    centroid-hmi:pr-N, centroid-backend:pr-N, hmi-profiler:pr-N
+#   pr    centroid-hmi:pr-N, centroid-backend:pr-N, hmi-profiler:pr-N,
+#         centroid-web:pr-N
 #   main  :<sha> and :latest (a DEBUG Flutter build), plus :<sha>-release /
 #         :latest-release (production mode) and :<sha>-profile /
 #         :latest-profile (Dart VM service kept, for docker/profiler)
 #   tag   :<sha> and :stable, built in release mode
+#
+# centroid-web has no debug or profile flavour: its main tags are :<sha> and
+# :latest, its tag tags :<sha> and :stable.
 #
 # A release or profile build also leaves the symbols of its Dart AOT library
 # (lib/libapp.so) in the package centroid-hmi-symbols, which is not public,
@@ -333,4 +338,90 @@ jobs:
         with:
           context: src
           file: src/docker/profiler/Dockerfile
+          tags: ${{ steps.tags.outputs.tags }}
+
+  # The browser client, which the station compose runs as `centroidx-web`
+  # and the station image preloads. Built here rather than inside
+  # docker/web/Dockerfile because `flutter build web` wants the whole SDK and
+  # a pub cache: baking that into an image whose runtime is nginx would be a
+  # 2 GB build stage for 51 MB of static files. Same split as the eLinux
+  # bundle above. Ported from tfc-hmi's retired centroid-hmi.yml, which was the
+  # only thing that ever pushed centroid-web; without it the station image's
+  # preload stopped at "manifest unknown" on centroid-web:latest.
+  web-bundle:
+    name: centroid-web bundle
+    runs-on: ubuntu-latest
+    outputs:
+      sha: ${{ steps.src.outputs.short_sha }}
+    steps:
+      - uses: actions/checkout@v4
+      - id: src
+        uses: ./.github/actions/checkout-source
+        with:
+          ref: ${{ inputs.ref }}
+          token: ${{ secrets.GH_PAT }}
+      - uses: ./.github/actions/setup-flutter
+      - uses: ./.github/actions/pub-get
+        with:
+          working-directory: src/centroid-hmi
+
+      # `lib/main_web.dart`, never `lib/main.dart`: the browser entrypoint
+      # registers the eight routes of `docs/web-client-scope.md` and leaves the
+      # rest out of the compile, D-Bus and the local database included.
+      # `--no-tree-shake-icons`: the web icon shaker keeps only the glyphs it
+      # can find as bare IconData constants, and Font Awesome's are wrapped in
+      # FaIconData, so it dropped glyphs the bundle draws.
+      - name: Build web client
+        working-directory: src/centroid-hmi
+        run: flutter build web -t lib/main_web.dart --release --no-tree-shake-icons --dart-define=CENTROIDX_CHAT=false --dart-define=CENTROIDX_KNOWLEDGE=false
+
+      # The gateway declaration must still be a placeholder here. If a build
+      # ever substitutes it, every station serving this image would dial
+      # whatever CI happened to have in the environment.
+      - name: Check the bundle carries an un-substituted declaration
+        working-directory: src/centroid-hmi
+        run: |
+          if ! grep -q 'content="$CENTROIDX_GATEWAY"' build/web/index.html; then
+            echo "::error::build/web/index.html lost its centroidx-gateway placeholder"
+            exit 1
+          fi
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: centroid-web-bundle
+          path: src/centroid-hmi/build/web/
+
+  web-image:
+    name: centroid-web image
+    needs: web-bundle
+    if: inputs.publish != 'pr' || inputs.pr_number != ''
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: ./.github/actions/checkout-source
+        with:
+          ref: ${{ inputs.ref }}
+          token: ${{ secrets.GH_PAT }}
+      - uses: actions/download-artifact@v4
+        with:
+          name: centroid-web-bundle
+          path: src/docker/web/bundle
+      - uses: ./.github/actions/ghcr-login
+        with:
+          token: ${{ secrets.GH_PAT }}
+      - name: Choose the tags
+        id: tags
+        env:
+          SHA: ${{ needs.web-bundle.outputs.sha }}
+          IMG: ghcr.io/centroid-is/centroid-web
+        run: |
+          case "${{ inputs.publish }}" in
+            pr)   tags="$IMG:pr-${{ inputs.pr_number }}" ;;
+            main) tags="$IMG:$SHA"$'\n'"$IMG:latest" ;;
+            tag)  tags="$IMG:$SHA"$'\n'"$IMG:stable" ;;
+          esac
+          { echo 'tags<<EOF'; echo "$tags"; echo 'EOF'; } >> "$GITHUB_OUTPUT"
+      - uses: ./.github/actions/docker-build-push
+        with:
+          context: src/docker/web
           tags: ${{ steps.tags.outputs.tags }}
