@@ -293,11 +293,16 @@ jobs:
           esac
           { echo 'tags<<EOF'; echo "$tags"; echo 'EOF'; } >> "$GITHUB_OUTPUT"
           { echo 'profile<<EOF'; echo "$IMG:$SHA-profile"; echo "$IMG:latest-profile"; echo 'EOF'; } >> "$GITHUB_OUTPUT"
+      # `gh_pat`: the backend's Dart solve has a private git dependency, which
+      # `dart pub get` inside the build clones through this BuildKit secret
+      # (see the Dockerfile's RUN --mount=type=secret). The runner's own git
+      # rewrite from checkout-source does not reach into `docker build`.
       - uses: ./.github/actions/docker-build-push
         with:
           context: src
           file: src/docker/backend/Dockerfile
           tags: ${{ steps.tags.outputs.tags }}
+          secrets: gh_pat=${{ secrets.GH_PAT }}
       - if: inputs.publish == 'main'
         uses: ./.github/actions/docker-build-push
         with:
@@ -305,6 +310,7 @@ jobs:
           file: src/docker/backend/Dockerfile
           target: profile
           tags: ${{ steps.tags.outputs.profile }}
+          secrets: gh_pat=${{ secrets.GH_PAT }}
 
   # python:alpine plus a stdlib script; built on every PR so docker/profiler
   # does not rot.
