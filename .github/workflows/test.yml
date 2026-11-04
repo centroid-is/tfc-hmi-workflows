@@ -263,6 +263,43 @@ jobs:
           dart analyze
           dart test
 
+  # packages/tfc_relay_sim (the simulated plant behind the web demo) arrives
+  # with CentroidX#676; the job passes trivially where the package is absent.
+  relay-sim-test:
+    needs: context
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: ./.github/actions/checkout-source
+        with:
+          ref: ${{ needs.context.outputs.ref }}
+          token: ${{ secrets.GH_PAT }}
+      - id: present
+        run: |
+          if [ -d src/packages/tfc_relay_sim ]; then echo present=true >> "$GITHUB_OUTPUT"
+          else echo present=false >> "$GITHUB_OUTPUT"; echo "::notice::packages/tfc_relay_sim is not on this ref; nothing to test"; fi
+      - if: steps.present.outputs.present == 'true'
+        uses: dart-lang/setup-dart@v1
+      - if: steps.present.outputs.present == 'true'
+        uses: ./.github/actions/pub-get
+        with:
+          command: dart pub get
+          working-directory: src/packages/tfc_relay_sim
+      - if: steps.present.outputs.present == 'true'
+        working-directory: src/packages/tfc_relay_sim
+        run: |
+          dart analyze
+          dart test --file-reporter "json:test-report.json"
+      # 41 tests on CentroidX#676; a selector that silently matches nothing
+      # is green in `dart test`, so the count is checked.
+      - name: At least 41 tests ran
+        if: always() && steps.present.outputs.present == 'true'
+        working-directory: src/packages/tfc_relay_sim
+        run: |
+          ran=$(grep -o '"type":"testStart"' test-report.json | wc -l)
+          echo "$ran tests ran"
+          [ "$ran" -ge 41 ]
+
   centroidx-upgrader-test:
     name: centroidx-upgrader-test (${{ matrix.os }})
     needs: context
@@ -524,6 +561,7 @@ jobs:
       - dart-packages
       - jbtm-test
       - plant-sim-test
+      - relay-sim-test
       - centroidx-upgrader-test
       - tfc-dart-test
       - windows-runner-cpp-test
