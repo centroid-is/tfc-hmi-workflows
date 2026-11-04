@@ -83,7 +83,8 @@ jobs:
             overlays/installer/usr/local/bin/centroidx-install \
             overlays/installer/usr/local/bin/centroidx-install-failsafe \
             overlays/installer/usr/local/bin/centroidx-gui-launch \
-            overlays/installer/usr/local/bin/centroidx-remote-access
+            overlays/installer/usr/local/bin/centroidx-remote-access \
+            $(ls overlays/installer-netboot/usr/local/bin/* netboot/*.sh 2>/dev/null)
 
       - name: Installer and firmware tests
         working-directory: src/os
@@ -369,6 +370,85 @@ jobs:
           path: |
             src/os/out/usb-installer.img.gz
             src/os/out/usb-installer.img.bmap
+          retention-days: 14
+
+      # The netboot installer (os/netboot/). Only for a ref that has it: tag
+      # builds of older releases go through this workflow too.
+      - name: Does this ref have a netboot installer
+        id: netboot
+        run: |
+          if [ -f installer-netboot.yaml ]; then echo "build=true" >> "$GITHUB_OUTPUT"; else echo "build=false" >> "$GITHUB_OUTPUT"; fi
+
+      # The raw USB image the two steps above unpacked is ~8 GB of real disk
+      # that nothing needs any more, and the netboot rootfs needs the room.
+      - name: Free the unpacked USB image
+        if: steps.netboot.outputs.build == 'true'
+        run: rm -f "$RUNNER_TEMP/usb.img"
+
+      # GPU, PRELOAD and CHANNEL as for the image: `generated` runs again and
+      # rewrites image-info, which the netboot payload carries.
+      - name: Build the netboot installer
+        if: steps.netboot.outputs.build == 'true'
+        run: make netboot DOCKER_TTY= GPU=${{ inputs.gpu || 'intel' }} PRELOAD=${{ inputs.preload && 'true' || 'false' }} CHANNEL=${{ inputs.channel || 'prerelease' }}
+
+      - name: Assert the netboot installer is the graphical installer, without the image
+        if: steps.netboot.outputs.build == 'true'
+        run: |
+          set +e
+          set -uo pipefail
+          sudo apt-get install -y squashfs-tools
+          N=out/netboot
+          fail=0
+          t() { if ! sh -c "$1"; then echo "::error::$2"; fail=1; fi; }
+          for f in vmlinuz initrd.img filesystem.squashfs SHA256SUMS image-info; do
+            t "test -s $N/$f" "out/netboot/$f missing or empty"
+          done
+          t "test \$(ls $N/centroidx-*.img.gz | wc -l) = 1" "out/netboot needs exactly one centroidx-*.img.gz"
+          t "test \$(ls $N/centroidx-*.img.bmap | wc -l) = 1" "out/netboot needs exactly one centroidx-*.img.bmap"
+          t "cd $N && sha256sum --check --strict --quiet SHA256SUMS" "out/netboot does not match its SHA256SUMS"
+          # Listed to a file: grep -q on a pipe fails under pipefail. The
+          # listing prefixes every path with squashfs-root; strip it so the
+          # paths read as they do on the booted installer.
+          unsquashfs -l $N/filesystem.squashfs | sed -n 's|^squashfs-root/|/|p' > "$RUNNER_TEMP/sq.list"
+          L="$RUNNER_TEMP/sq.list"
+          W=/etc/systemd/system/multi-user.target.wants
+          for u in centroidx-netboot-payload centroidx-gui centroidx-remote-access centroidx-novnc; do
+            t "grep -qx '$W/$u.service' $L" "$u.service is not enabled in the squashfs"
+          done
+          t "! grep -qx '$W/centroidx-installer.service' $L" "the text installer is enabled instead of the GUI"
+          for b in centroidx-install centroidx-netboot-payload centroidx-setup centroidx-gui-launch centroidx-keyboard; do
+            t "grep -qx '/usr/local/bin/$b' $L" "/usr/local/bin/$b missing from the squashfs"
+          done
+          t "grep -q '^/opt/centroidx-setup/lib/libflutter_elinux_wayland.so$' $L" "setup app has no engine .so"
+          t "! grep -q '^/opt/centroidx/centroidx-.*\.img' $L" "the station image is inside the squashfs; it belongs beside it"
+          t "! grep -q '^/boot/vmlinuz' $L" "/boot is in the squashfs"
+          ls -lh $N
+          exit $fail
+
+      - name: Netboot the installer and photograph it
+        if: steps.netboot.outputs.build == 'true'
+        run: python3 scripts/boot-test.py --netboot out/netboot --out out/boot-test-netboot
+
+      - uses: actions/upload-artifact@v4
+        if: always() && steps.netboot.outputs.build == 'true'
+        with:
+          name: station-boot-test-netboot
+          path: src/os/out/boot-test-netboot
+          retention-days: 14
+
+      # Without the image: that is the station-image artifact's, and 3 GB twice
+      # is 3 GB for nothing. main-prerelease.yml puts the two back together.
+      - uses: actions/upload-artifact@v4
+        if: steps.netboot.outputs.build == 'true'
+        with:
+          name: station-netboot
+          path: |
+            src/os/out/netboot/vmlinuz
+            src/os/out/netboot/initrd.img
+            src/os/out/netboot/filesystem.squashfs
+            src/os/out/netboot/SHA256SUMS
+            src/os/out/netboot/image-info
+            src/os/out/netboot/centroidx-*.img.bmap
           retention-days: 14
 
       # Assets go to `create`, not a later upload, so a failed upload cannot

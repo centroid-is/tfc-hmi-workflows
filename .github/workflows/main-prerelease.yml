@@ -175,6 +175,7 @@ jobs:
           | Windows sideload | \`centroidx_windows_amd64.msix\` + \`centroidx-sideload.cer\` | |
           | Linux | \`centroidx_linux_x64.tar.gz\` | |
           | Station USB installer | \`usb-installer.img.gz.part*\` + \`usb-installer.img.bmap\` | attached about 25 minutes after the rest; join with \`cat usb-installer.img.gz.part* > usb-installer.img.gz\`, checksums in \`SHA256SUMS-station.txt\` |
+          | Station netboot installer | \`netboot-*\` | for the office netboot server, attached after the USB installer; lay out with \`os/netboot/fetch-release.sh\`, checksums in \`SHA256SUMS-netboot.txt\` |
 
           centroidx-manager for Windows, macOS and Linux is attached as well. Checksums in \`SHA256SUMS.txt\`."
 
@@ -244,6 +245,68 @@ jobs:
             split -b 800000000 -d -a 2 usb-installer.img.gz usb-installer.img.gz.part && rm -f usb-installer.img.gz
           fi
           sha256sum usb-installer.img.gz* usb-installer.img.bmap > SHA256SUMS-station.txt
+          ls -la
+
+          upload() {
+            local f=$1 attempt
+            for attempt in 1 2 3; do
+              if gh release upload main-latest --repo "$GITHUB_REPOSITORY" --clobber "$f"; then return 0; fi
+              echo "::warning::upload of $f failed (attempt $attempt)"; sleep $((attempt * 30))
+            done
+            return 1
+          }
+          failed=()
+          while read -r f; do upload "$f" || failed+=("$f"); done < <(ls -rS -- *)
+          if [ "${#failed[@]}" -gt 0 ]; then
+            echo "::error::failed to upload: ${failed[*]}"
+            exit 1
+          fi
+
+      # The netboot installer (tfc-hmi os/netboot/), after the stick so a
+      # failure here leaves the stick published. The station-netboot artifact
+      # has everything but the image, which is the station-image artifact's.
+      # Absent for a source commit from before the netboot installer existed,
+      # which is not an error.
+      - uses: actions/download-artifact@v4
+        id: netboot
+        continue-on-error: true
+        with:
+          name: station-netboot
+          path: netboot/
+      - uses: actions/download-artifact@v4
+        if: steps.netboot.outcome == 'success'
+        with:
+          name: station-image
+          path: station-image/
+      - name: Attach the netboot installer
+        if: steps.netboot.outcome == 'success'
+        env:
+          GH_TOKEN: ${{ secrets.GH_PAT }}
+        run: |
+          set -uo pipefail
+          mapfile -t imgs < <(find station-image -name 'centroidx-*.img.gz')
+          if [ "${#imgs[@]}" != 1 ]; then
+            echo "::error::the station-image artifact has ${#imgs[@]} centroidx-*.img.gz, not one"; exit 1
+          fi
+          mv "${imgs[0]}" netboot/
+          # The image has to be the one the netboot SHA256SUMS was made with, or
+          # every station netbooted from this release refuses the payload.
+          if ! (cd netboot && sha256sum --check --strict SHA256SUMS); then
+            echo "::error::the netboot files do not match their SHA256SUMS"; exit 1
+          fi
+          # Prefixed: main-latest also carries the apps and the stick, and a
+          # bare vmlinuz or SHA256SUMS there says nothing about what it is.
+          # os/netboot/fetch-release.sh strips the prefix and joins the parts.
+          mkdir -p netboot-release
+          for f in netboot/*; do mv "$f" "netboot-release/netboot-$(basename "$f")"; done
+          cd netboot-release
+          # The 2 GiB asset limit and the 800 MB parts, as for the stick.
+          for f in *; do
+            if [ "$(stat -c %s "$f")" -ge 2147483648 ]; then
+              split -b 800000000 -d -a 2 "$f" "$f.part" && rm -f "$f"
+            fi
+          done
+          sha256sum -- * > SHA256SUMS-netboot.txt
           ls -la
 
           upload() {
