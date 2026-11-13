@@ -266,6 +266,13 @@ jobs:
   # The backend's -profile variant is a named stage of the same Dockerfile;
   # built in the same job so it reuses the open62541 layers instead of
   # rebuilding them on a second runner.
+  #
+  # Both builds get GH_PAT as the buildx secret `gh_pat`: pub fetches the
+  # private centroid-is packages (dart_umas, ...) with git@github.com: URLs,
+  # and the Dockerfile's `RUN --mount=type=secret,id=gh_pat` rewrites them to
+  # HTTPS with the token. Without it pub tries SSH and stops at "Could not
+  # read from remote repository". A secret mount, not a build-arg, keeps the
+  # token out of the image layers and the build log.
   backend-image:
     name: centroid-backend image
     if: inputs.publish != 'pr' || inputs.pr_number != ''
@@ -298,6 +305,8 @@ jobs:
           context: src
           file: src/docker/backend/Dockerfile
           tags: ${{ steps.tags.outputs.tags }}
+          secrets: |
+            gh_pat=${{ secrets.GH_PAT }}
       - if: inputs.publish == 'main'
         uses: ./.github/actions/docker-build-push
         with:
@@ -305,6 +314,8 @@ jobs:
           file: src/docker/backend/Dockerfile
           target: profile
           tags: ${{ steps.tags.outputs.profile }}
+          secrets: |
+            gh_pat=${{ secrets.GH_PAT }}
 
   # python:alpine plus a stdlib script; built on every PR so docker/profiler
   # does not rot.
