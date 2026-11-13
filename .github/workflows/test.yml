@@ -104,7 +104,8 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        os: [ubuntu-latest, macos-latest, windows-latest]
+        # Goldens are rendered in ubuntu:26.04 (CentroidX docker/goldens/Dockerfile); pixels follow the distro libm, so pin this and bump both together.
+        os: [ubuntu-26.04, macos-latest, windows-latest]
     steps:
       - uses: actions/checkout@v4
       - uses: ./.github/actions/checkout-source
