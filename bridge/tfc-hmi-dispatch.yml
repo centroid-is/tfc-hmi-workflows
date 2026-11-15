@@ -4,9 +4,10 @@
 # tfc-hmi is private; its builds, tests and releases run in the public
 # repository centroid-is/tfc-hmi-workflows. This is the one workflow that has
 # to stay in tfc-hmi: it tells the other repository that something happened.
-# It runs on a self-hosted runner (runs-on: self-hosted), so it costs no
-# private-repo Actions minutes. The runner needs git, gh and bash (Git for
-# Windows is enough on a Windows box), nothing else.
+# It runs on the organisation's own runners (runs-on: centroid), so it costs
+# no private-repo Actions minutes. Those start every job in a fresh pod from
+# a small image that has git, curl and bash but is not documented to carry
+# gh, so each job fetches a pinned gh when there is none.
 #
 # Needs one secret in tfc-hmi, WORKFLOWS_DISPATCH_TOKEN: a token with
 # Contents and Pull requests read/write on centroid-is/tfc-hmi-workflows.
@@ -41,6 +42,10 @@
 # committed to it. A workflow change worth keeping has to reach main over
 # there on its own, before that.
 #
+# The Linux legs of the test suites do not go through here: they run in
+# tfc-hmi itself, in linux-tests.yml, on the same runners. Tests over there
+# covers macOS, Windows and every build.
+#
 # tfc-hmi-workflows is PUBLIC and tfc-hmi is not. The mirror therefore carries
 # the pull request's number and commit and nothing else: it is titled "pr-N",
 # has no description, and neither the source file nor the commit message names
@@ -68,8 +73,19 @@ env:
 jobs:
   dispatch:
     if: github.event_name == 'push'
-    runs-on: self-hosted
+    runs-on: centroid
     steps:
+      # The runner image is small; see the top of this file.
+      - name: gh, when the image has none
+        shell: bash
+        run: |
+          set -euo pipefail
+          if ! command -v gh >/dev/null; then
+            v=2.74.0
+            curl -fsSL --retry 3 "https://github.com/cli/cli/releases/download/v$v/gh_${v}_linux_amd64.tar.gz" \
+              | tar -xz -C "$RUNNER_TEMP"
+            echo "$RUNNER_TEMP/gh_${v}_linux_amd64/bin" >> "$GITHUB_PATH"
+          fi
       - name: Send the push as a repository_dispatch
         shell: bash
         env:
@@ -92,13 +108,24 @@ jobs:
 
   mirror-pr:
     if: github.event_name == 'pull_request'
-    runs-on: self-hosted
+    runs-on: centroid
     env:
       GH_TOKEN: ${{ secrets.WORKFLOWS_DISPATCH_TOKEN }}
       ACTION: ${{ github.event.action }}
       PR_NUMBER: ${{ github.event.pull_request.number }}
       PR_SHA: ${{ github.event.pull_request.head.sha }}
     steps:
+      # The runner image is small; see the top of this file.
+      - name: gh, when the image has none
+        shell: bash
+        run: |
+          set -euo pipefail
+          if ! command -v gh >/dev/null; then
+            v=2.74.0
+            curl -fsSL --retry 3 "https://github.com/cli/cli/releases/download/v$v/gh_${v}_linux_amd64.tar.gz" \
+              | tar -xz -C "$RUNNER_TEMP"
+            echo "$RUNNER_TEMP/gh_${v}_linux_amd64/bin" >> "$GITHUB_PATH"
+          fi
       - name: Check out tfc-hmi-workflows
         uses: actions/checkout@v4
         with:
@@ -127,8 +154,8 @@ jobs:
 
           # Start from what the mirror already holds, so anything committed
           # to it by hand survives; from main only when there is no mirror.
-          # ls-remote, not the local refs: a self-hosted runner keeps its
-          # workspace, and with it remote-tracking refs of deleted branches.
+          # ls-remote, not the local refs: a runner that keeps its workspace
+          # keeps remote-tracking refs of deleted branches with it.
           start_from() {
             git fetch --quiet origin main
             if git ls-remote --exit-code --heads origin "$branch" >/dev/null; then
