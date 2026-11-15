@@ -6,8 +6,11 @@ name: Tests
 # public and tfc-hmi is not.
 run-name: ${{ github.head_ref || github.event.action || github.event_name }}
 
-# Everything a pull request of tfc-hmi has to pass, plus the builds it must
-# prove it does not break.
+# Everything a pull request of tfc-hmi has to pass on macOS and Windows, plus
+# the builds it must prove it does not break. The Linux legs of the suites are
+# not here: they run in tfc-hmi itself, as its own workflow, and show on the
+# pull request there as ordinary checks. So the status this reports is half of
+# the verdict, and no suite below has an ubuntu leg.
 #
 # A pull request of tfc-hmi arrives as a mirror pull request here: the bridge
 # workflow in tfc-hmi keeps a branch tfc-hmi/pr-N whose one file,
@@ -104,23 +107,15 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        # Goldens are rendered in ubuntu:26.04 (CentroidX docker/goldens/Dockerfile); pixels follow the distro libm, so pin this and bump both together.
-        os: [ubuntu-26.04, macos-latest, windows-latest]
+        # Goldens are compared on Linux only, so not here.
+        os: [macos-latest, windows-latest]
     steps:
       - uses: actions/checkout@v4
       - uses: ./.github/actions/checkout-source
         with:
           ref: ${{ needs.context.outputs.ref }}
           token: ${{ secrets.GH_PAT }}
-      - name: Preference-store construction gate
-        if: runner.os == 'Linux'
-        working-directory: src
-        run: |
-          bash scripts/check-preferences-construction.sh
-          bash scripts/check-flutter-preferences-retired.sh
       - uses: ./.github/actions/setup-flutter
-      - if: runner.os == 'Linux'
-        run: sudo apt-get install -y libglib2.0-dev
       - uses: ./.github/actions/pub-get
         with:
           working-directory: src
@@ -130,8 +125,8 @@ jobs:
           # test/tools/*_test.dart read the workflows from this repository.
           CENTROIDX_WORKFLOWS_DIR: ${{ github.workspace }}/.github/workflows
         run: flutter test test/ --file-reporter "json:test-report.json"
-      # Goldens are compared on Linux only; none may be skipped there.
-      - name: The goldens ran
+      # Goldens are compared on Linux only; here every one must be skipped.
+      - name: The goldens were skipped
         if: always()
         working-directory: src
         run: bash scripts/check-goldens-ran.sh
@@ -150,7 +145,7 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        os: [ubuntu-latest, macos-latest, windows-latest]
+        os: [macos-latest, windows-latest]
     steps:
       - uses: actions/checkout@v4
       - uses: ./.github/actions/checkout-source
@@ -158,8 +153,6 @@ jobs:
           ref: ${{ needs.context.outputs.ref }}
           token: ${{ secrets.GH_PAT }}
       - uses: ./.github/actions/setup-flutter
-      - if: runner.os == 'Linux'
-        run: sudo apt-get install -y libglib2.0-dev
       - uses: ./.github/actions/pub-get
         with:
           working-directory: src/centroid-hmi
@@ -184,7 +177,7 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        os: [ubuntu-latest, macos-latest, windows-latest]
+        os: [macos-latest, windows-latest]
         package: [modbus_client, modbus_client_tcp, tfc_mcp_server, tfc_access]
     steps:
       - uses: actions/checkout@v4
@@ -212,7 +205,7 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        os: [ubuntu-latest, macos-latest, windows-latest]
+        os: [macos-latest, windows-latest]
     steps:
       - uses: actions/checkout@v4
       - uses: ./.github/actions/checkout-source
@@ -235,35 +228,6 @@ jobs:
           echo "$ran tests ran"
           [ "$ran" -ge 220 ]
 
-  # packages/tfc_plant_sim exists only on branches that carry the fake
-  # plant (bench/fake-plant, CentroidX#588) until that lands on main; the
-  # job passes trivially where the package is absent.
-  plant-sim-test:
-    needs: context
-    runs-on: ubuntu-latest
-    steps:
-      - uses: actions/checkout@v4
-      - uses: ./.github/actions/checkout-source
-        with:
-          ref: ${{ needs.context.outputs.ref }}
-          token: ${{ secrets.GH_PAT }}
-      - id: present
-        run: |
-          if [ -d src/packages/tfc_plant_sim ]; then echo present=true >> "$GITHUB_OUTPUT"
-          else echo present=false >> "$GITHUB_OUTPUT"; echo "::notice::packages/tfc_plant_sim is not on this ref; nothing to test"; fi
-      - if: steps.present.outputs.present == 'true'
-        uses: dart-lang/setup-dart@v1
-      - if: steps.present.outputs.present == 'true'
-        uses: ./.github/actions/pub-get
-        with:
-          command: dart pub get
-          working-directory: src/packages/tfc_plant_sim
-      - if: steps.present.outputs.present == 'true'
-        working-directory: src/packages/tfc_plant_sim
-        run: |
-          dart analyze
-          dart test
-
   centroidx-upgrader-test:
     name: centroidx-upgrader-test (${{ matrix.os }})
     needs: context
@@ -271,7 +235,7 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        os: [ubuntu-latest, macos-latest, windows-latest]
+        os: [macos-latest, windows-latest]
     steps:
       - uses: actions/checkout@v4
       - uses: ./.github/actions/checkout-source
@@ -293,8 +257,6 @@ jobs:
       fail-fast: false
       matrix:
         include:
-          - os: ubuntu-latest
-            timescaledb_external: ''
           - os: macos-latest
             timescaledb_external: '1'
           - os: windows-latest
@@ -307,8 +269,7 @@ jobs:
           token: ${{ secrets.GH_PAT }}
       - uses: dart-lang/setup-dart@v1
 
-      # Ubuntu runs TimescaleDB in Docker from the tests themselves; the other
-      # two have no Docker and get a native server on localhost instead.
+      # Neither has Docker, so the tests get a native server on localhost.
       - name: TimescaleDB (macOS)
         if: runner.os == 'macOS'
         run: |
@@ -374,7 +335,7 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        os: [ubuntu-latest, windows-latest]
+        os: [windows-latest]
     steps:
       - uses: actions/checkout@v4
       - uses: ./.github/actions/checkout-source
@@ -394,7 +355,7 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        os: [ubuntu-latest, macos-latest]
+        os: [macos-latest]
     steps:
       - uses: actions/checkout@v4
       - uses: ./.github/actions/checkout-source
@@ -417,7 +378,7 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        os: [ubuntu-latest, macos-latest, windows-latest]
+        os: [macos-latest, windows-latest]
     steps:
       - uses: actions/checkout@v4
       - uses: ./.github/actions/checkout-source
@@ -443,7 +404,7 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        os: [ubuntu-latest, macos-latest]
+        os: [macos-latest]
     steps:
       - uses: actions/checkout@v4
       - uses: ./.github/actions/checkout-source
@@ -524,7 +485,6 @@ jobs:
       - centroid-hmi-test
       - dart-packages
       - jbtm-test
-      - plant-sim-test
       - centroidx-upgrader-test
       - tfc-dart-test
       - windows-runner-cpp-test
