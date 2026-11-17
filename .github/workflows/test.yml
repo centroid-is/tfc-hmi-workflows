@@ -24,6 +24,13 @@ run-name: ${{ github.head_ref || github.event.action || github.event_name }}
 # A pull request of this repository itself, with no source file, tests
 # tfc-hmi main against the changed workflows. Pushes to tfc-hmi main arrive
 # as repository_dispatch "push-main"; a hand run takes any ref.
+#
+# macOS runners are few, and a mirror run used to wait hours for them after
+# Linux and Windows were done. So the macOS legs run for main (push-main), for
+# hand runs and for pull requests of this repository, and not for mirror
+# pull requests. The context job decides (output macos); every matrix
+# excludes macos-latest when it is false, and report counts the skipped
+# macos-build as passed.
 
 on:
   pull_request:
@@ -36,6 +43,10 @@ on:
         description: tfc-hmi commit, branch or tag to test
         type: string
         default: main
+      macos:
+        description: Run the macOS legs
+        type: boolean
+        default: true
 
 permissions:
   contents: read
@@ -56,6 +67,7 @@ jobs:
       pr: ${{ steps.ctx.outputs.pr }}
       report: ${{ steps.ctx.outputs.report }}
       repo: ${{ steps.ctx.outputs.repo }}
+      macos: ${{ steps.ctx.outputs.macos }}
     steps:
       - uses: actions/checkout@v4
       - id: ctx
@@ -63,15 +75,17 @@ jobs:
           DISPATCH_SHA: ${{ github.event.client_payload.sha }}
           DISPATCH_REPO: ${{ github.event.client_payload.repository }}
           INPUT_REF: ${{ inputs.ref }}
+          INPUT_MACOS: ${{ inputs.macos }}
         run: |
-          ref=''; pr=''; report=false; repo=centroid-is/CentroidX
+          ref=''; pr=''; report=false; repo=centroid-is/CentroidX; macos=true
           if [ "$GITHUB_EVENT_NAME" = pull_request ]; then
             if [ -f tfc-hmi-source.json ]; then
               # Base64 of the JSON; a mirror written before that holds it plain.
               src=$(base64 -d tfc-hmi-source.json 2>/dev/null | jq -ec . 2>/dev/null) || src=$(cat tfc-hmi-source.json)
               ref=$(jq -r .sha <<<"$src"); pr=$(jq -r .pr <<<"$src"); report=true
               repo=$(jq -r '.repository // empty' <<<"$src"); repo=${repo:-centroid-is/CentroidX}
-              echo "mirror of tfc-hmi#$pr"
+              macos=false
+              echo "mirror of tfc-hmi#$pr: macOS legs skipped, they run on main"
             else
               ref=main
               echo "a pull request of this repository: testing tfc-hmi main against it"
@@ -80,11 +94,13 @@ jobs:
             ref=$DISPATCH_SHA; report=true; repo=${DISPATCH_REPO:-$repo}
           else
             ref=$INPUT_REF
+            if [ "$INPUT_MACOS" = false ]; then macos=false; fi
           fi
           echo "ref=$ref" >> "$GITHUB_OUTPUT"
           echo "pr=$pr" >> "$GITHUB_OUTPUT"
           echo "report=$report" >> "$GITHUB_OUTPUT"
           echo "repo=$repo" >> "$GITHUB_OUTPUT"
+          echo "macos=$macos" >> "$GITHUB_OUTPUT"
           echo "group=${pr:+pr-$pr}" >> "$GITHUB_OUTPUT"
           echo "testing tfc-hmi $ref ${pr:+(PR #$pr)}"
       - name: Report pending to tfc-hmi
@@ -106,6 +122,9 @@ jobs:
       matrix:
         # Goldens are rendered in ubuntu:26.04 (CentroidX docker/goldens/Dockerfile); pixels follow the distro libm, so pin this and bump both together.
         os: [ubuntu-26.04, macos-latest, windows-latest]
+        # macOS runners are few; PR mirrors leave them to main (context.macos).
+        exclude:
+          - os: ${{ needs.context.outputs.macos != 'true' && 'macos-latest' || 'none' }}
     steps:
       - uses: actions/checkout@v4
       - uses: ./.github/actions/checkout-source
@@ -151,6 +170,9 @@ jobs:
       fail-fast: false
       matrix:
         os: [ubuntu-latest, macos-latest, windows-latest]
+        # macOS runners are few; PR mirrors leave them to main (context.macos).
+        exclude:
+          - os: ${{ needs.context.outputs.macos != 'true' && 'macos-latest' || 'none' }}
     steps:
       - uses: actions/checkout@v4
       - uses: ./.github/actions/checkout-source
@@ -186,6 +208,9 @@ jobs:
       matrix:
         os: [ubuntu-latest, macos-latest, windows-latest]
         package: [modbus_client, modbus_client_tcp, tfc_mcp_server, tfc_access]
+        # macOS runners are few; PR mirrors leave them to main (context.macos).
+        exclude:
+          - os: ${{ needs.context.outputs.macos != 'true' && 'macos-latest' || 'none' }}
     steps:
       - uses: actions/checkout@v4
       - uses: ./.github/actions/checkout-source
@@ -213,6 +238,9 @@ jobs:
       fail-fast: false
       matrix:
         os: [ubuntu-latest, macos-latest, windows-latest]
+        # macOS runners are few; PR mirrors leave them to main (context.macos).
+        exclude:
+          - os: ${{ needs.context.outputs.macos != 'true' && 'macos-latest' || 'none' }}
     steps:
       - uses: actions/checkout@v4
       - uses: ./.github/actions/checkout-source
@@ -272,6 +300,9 @@ jobs:
       fail-fast: false
       matrix:
         os: [ubuntu-latest, macos-latest, windows-latest]
+        # macOS runners are few; PR mirrors leave them to main (context.macos).
+        exclude:
+          - os: ${{ needs.context.outputs.macos != 'true' && 'macos-latest' || 'none' }}
     steps:
       - uses: actions/checkout@v4
       - uses: ./.github/actions/checkout-source
@@ -292,13 +323,10 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        include:
-          - os: ubuntu-latest
-            timescaledb_external: ''
-          - os: macos-latest
-            timescaledb_external: '1'
-          - os: windows-latest
-            timescaledb_external: '1'
+        os: [ubuntu-latest, macos-latest, windows-latest]
+        # macOS runners are few; PR mirrors leave them to main (context.macos).
+        exclude:
+          - os: ${{ needs.context.outputs.macos != 'true' && 'macos-latest' || 'none' }}
     steps:
       - uses: actions/checkout@v4
       - uses: ./.github/actions/checkout-source
@@ -355,7 +383,7 @@ jobs:
           working-directory: src/packages/tfc_dart
       - working-directory: src/packages/tfc_dart
         env:
-          TIMESCALEDB_EXTERNAL: ${{ matrix.timescaledb_external }}
+          TIMESCALEDB_EXTERNAL: ${{ runner.os != 'Linux' && '1' || '' }}
         run: dart test
       - if: always()
         uses: actions/upload-artifact@v4
@@ -395,6 +423,9 @@ jobs:
       fail-fast: false
       matrix:
         os: [ubuntu-latest, macos-latest]
+        # macOS runners are few; PR mirrors leave them to main (context.macos).
+        exclude:
+          - os: ${{ needs.context.outputs.macos != 'true' && 'macos-latest' || 'none' }}
     steps:
       - uses: actions/checkout@v4
       - uses: ./.github/actions/checkout-source
@@ -418,6 +449,9 @@ jobs:
       fail-fast: false
       matrix:
         os: [ubuntu-latest, macos-latest, windows-latest]
+        # macOS runners are few; PR mirrors leave them to main (context.macos).
+        exclude:
+          - os: ${{ needs.context.outputs.macos != 'true' && 'macos-latest' || 'none' }}
     steps:
       - uses: actions/checkout@v4
       - uses: ./.github/actions/checkout-source
@@ -444,6 +478,9 @@ jobs:
       fail-fast: false
       matrix:
         os: [ubuntu-latest, macos-latest]
+        # macOS runners are few; PR mirrors leave them to main (context.macos).
+        exclude:
+          - os: ${{ needs.context.outputs.macos != 'true' && 'macos-latest' || 'none' }}
     steps:
       - uses: actions/checkout@v4
       - uses: ./.github/actions/checkout-source
@@ -473,6 +510,7 @@ jobs:
       group: ${{ needs.context.outputs.group }}
   macos-build:
     needs: context
+    if: needs.context.outputs.macos == 'true'
     uses: ./.github/workflows/macos.yml
     secrets: inherit
     with:
@@ -493,6 +531,7 @@ jobs:
     with:
       ref: ${{ needs.context.outputs.ref }}
       group: ${{ needs.context.outputs.group }}
+      macos: ${{ needs.context.outputs.macos == 'true' }}
   elinux-images:
     needs: context
     uses: ./.github/workflows/elinux.yml
@@ -542,8 +581,10 @@ jobs:
       - env:
           GH_TOKEN: ${{ secrets.GH_PAT }}
           RESULTS: ${{ toJSON(needs) }}
+          MACOS: ${{ needs.context.outputs.macos }}
         run: |
-          failed=$(echo "$RESULTS" | jq -r 'to_entries[] | select(.value.result != "success" and .key != "context") | .key' | tr '\n' ' ')
+          # macos-build is skipped on purpose when context.macos is false.
+          failed=$(echo "$RESULTS" | jq -r 'to_entries[] | select(.key != "context" and .value.result != "success") | select(.key != "macos-build" or .value.result != "skipped" or env.MACOS == "true") | .key' | tr '\n' ' ')
           if [ -z "$failed" ]; then state=success; desc='all green'; else state=failure; desc="failed: $failed"; fi
           echo "$state: $desc"
           gh api repos/${{ needs.context.outputs.repo }}/statuses/${{ needs.context.outputs.ref }} \

@@ -23,6 +23,10 @@ on:
         description: Concurrency key; runs sharing it supersede each other (PRs). Empty = never cancelled.
         type: string
         default: ''
+      macos:
+        description: Build and test the macOS (darwin) leg; Tests passes false on PR mirrors.
+        type: boolean
+        default: true
   workflow_dispatch:
     inputs:
       ref:
@@ -30,6 +34,9 @@ on:
         type: string
         default: main
       run_integration_tests:
+        type: boolean
+        default: true
+      macos:
         type: boolean
         default: true
 
@@ -49,24 +56,15 @@ jobs:
     runs-on: ${{ matrix.os }}
     strategy:
       fail-fast: false
+      # JSON so that the darwin entry can be left out (inputs.macos): an
+      # exclude cannot remove a leg that include defines, since an include
+      # entry that matches no leg is added as a new one.
       matrix:
-        include:
-          - os: windows-latest
-            goos: windows
-            goarch: amd64
-            artifact_name: centroidx-manager_windows_amd64.exe
-            cgo: '0'
-          - os: ubuntu-latest
-            goos: linux
-            goarch: amd64
-            artifact_name: centroidx-manager_linux_amd64
-            cgo: '1'
-          - os: macos-latest
-            goos: darwin
-            goarch: arm64
-            artifact_name: centroidx-manager_darwin_arm64.dmg
-            binary_name: centroidx-manager
-            cgo: '1'
+        include: >-
+          ${{ fromJSON(format('[{0},{1}{2}]',
+            '{"os":"windows-latest","goos":"windows","goarch":"amd64","artifact_name":"centroidx-manager_windows_amd64.exe","cgo":"0"}',
+            '{"os":"ubuntu-latest","goos":"linux","goarch":"amd64","artifact_name":"centroidx-manager_linux_amd64","cgo":"1"}',
+            inputs.macos && ',{"os":"macos-latest","goos":"darwin","goarch":"arm64","artifact_name":"centroidx-manager_darwin_arm64.dmg","binary_name":"centroidx-manager","cgo":"1"}' || '')) }}
     steps:
       - uses: actions/checkout@v4
 
@@ -237,13 +235,9 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        include:
-          - os: windows-latest
-            cgo: '0'
-          - os: ubuntu-latest
-            cgo: '1'
-          - os: macos-latest
-            cgo: '1'
+        os: [windows-latest, ubuntu-latest, macos-latest]
+        exclude:
+          - os: ${{ !inputs.macos && 'macos-latest' || 'none' }}
     steps:
       - uses: actions/checkout@v4
       - uses: ./.github/actions/checkout-source
@@ -266,12 +260,12 @@ jobs:
         shell: bash
         working-directory: src/tools/centroidx-manager
         env:
-          CGO_ENABLED: ${{ matrix.cgo }}
+          CGO_ENABLED: ${{ runner.os == 'Windows' && '0' || '1' }}
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: go test -tags integration -v -timeout 300s ./internal/update/ -run TestIntegration
       - name: Platform integration tests
         shell: bash
         working-directory: src/tools/centroidx-manager
         env:
-          CGO_ENABLED: ${{ matrix.cgo }}
+          CGO_ENABLED: ${{ runner.os == 'Windows' && '0' || '1' }}
         run: go test -tags integration -v -timeout 120s ./internal/platform/ -run TestIntegration
