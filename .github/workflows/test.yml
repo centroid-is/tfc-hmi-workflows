@@ -312,10 +312,18 @@ jobs:
       - name: TimescaleDB (macOS)
         if: runner.os == 'macOS'
         run: |
+          # A fresh index first: an image's stale one has pointed at bottles
+          # the tap had since replaced.
+          brew update --quiet || true
           brew tap timescale/tap || true
           # Homebrew refuses formulae from third-party taps until the tap is trusted.
           brew trust timescale/tap || true
-          brew install timescale/tap/timescaledb
+          # timescaledb-tools is only a recommended dependency and only brings
+          # timescaledb-tune, which nothing here runs (postgresql.conf is
+          # written below). Leaving it out keeps a broken tools release (its
+          # 0.19.1 shipped with a checksum that did not match) from failing
+          # the database setup.
+          brew install --without-timescaledb-tools timescale/tap/timescaledb
           PG_FORMULA=$(basename "$(ls -d /opt/homebrew/opt/postgresql@* | sort -V | tail -1)")
           echo "/opt/homebrew/opt/$PG_FORMULA/bin" >> "$GITHUB_PATH"
           export PATH="/opt/homebrew/opt/$PG_FORMULA/bin:$PATH"
